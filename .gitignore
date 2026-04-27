@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.deploy-hostinger/
+*.zip
+
+# Local form data can contain submissions and uploaded file data.
+data/forms.json
+
+.env
+.env.*
+!.env.example
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

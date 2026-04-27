@@ -1,0 +1,30 @@
+{
+  "name": "mini-tally",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "app.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "server": "node server/index.js",
+    "start": "node app.js",
+    "check": "npm run build",
+    "hostinger:build": "npm install --omit=optional && npm run build",
+    "deploy:hostinger": "powershell -ExecutionPolicy Bypass -File scripts/deploy-hostinger-ssh.ps1"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.4",
+    "vite": "^7.1.9",
+    "typescript": "^5.9.3",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "lucide-react": "^0.468.0",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {}
+}
