@@ -626,23 +626,33 @@ app.get('/api/forms/:id/partials.csv', async (req, res) => {
   res.send(`\uFEFF${csv}`);
 });
 
-try {
-  await fs.access(distDir);
-  app.use(express.static(distDir));
-  app.use((_req, res) => res.sendFile(path.join(distDir, 'index.html')));
-} catch {
-  app.get('/', (_req, res) => {
-    res.send('Mini Tally API is running. Start the Vite dev server with npm run dev.');
+async function configureStaticRoutes() {
+  try {
+    await fs.access(distDir);
+    app.use(express.static(distDir));
+    app.use((_req, res) => res.sendFile(path.join(distDir, 'index.html')));
+  } catch {
+    app.get('/', (_req, res) => {
+      res.send('Mini Tally API is running. Start the Vite dev server with npm run dev.');
+    });
+  }
+}
+
+async function start() {
+  await configureStaticRoutes();
+  console.log(`Starting Mini Tally with Node ${process.version}, port ${port}, host ${listenHost}`);
+
+  const server = app.listen(port, listenHost, () => {
+    console.log(`Mini Tally running at http://${listenHost}:${port}`);
+  });
+
+  server.on('error', (error) => {
+    console.error('Server failed to start:', error);
+    process.exit(1);
   });
 }
 
-console.log(`Starting Mini Tally with Node ${process.version}, port ${port}, host ${listenHost}`);
-
-const server = app.listen(port, listenHost, () => {
-  console.log(`Mini Tally running at http://${listenHost}:${port}`);
-});
-
-server.on('error', (error) => {
-  console.error('Server failed to start:', error);
+start().catch((error) => {
+  console.error('Failed to start Mini Tally:', error);
   process.exit(1);
 });
