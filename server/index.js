@@ -94,7 +94,7 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  const raw = await fs.readFile(dbPath, 'utf8');
+  const raw = (await fs.readFile(dbPath, 'utf8')).replace(/^\uFEFF/, '');
   const db = JSON.parse(raw);
   return {
     forms: Array.isArray(db.forms) ? db.forms.map(migrateForm) : [],

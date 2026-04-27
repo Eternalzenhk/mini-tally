@@ -10,9 +10,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$PackageScript = Join-Path $Root "scripts\deploy-hostinger.ps1"
-$PackageName = ".hostinger-release.zip"
-$ZipPath = Join-Path $Root $PackageName
+$PackageName = ".hostinger-release.tar.gz"
+$PackagePath = Join-Path $Root $PackageName
 
 function Assert-Value($Name, $Value) {
   if ([string]::IsNullOrWhiteSpace($Value)) {
@@ -34,13 +33,44 @@ if ($KeyPath -and -not (Test-Path -LiteralPath $KeyPath)) {
 
 Set-Location $Root
 
-$packageArgs = @("-Output", $PackageName)
-if ($IncludeLocalData) {
-  $packageArgs += "-IncludeLocalData"
+Write-Host "Building Mini Tally..." -ForegroundColor Cyan
+npm install
+if ($LASTEXITCODE -ne 0) {
+  throw "npm install failed."
+}
+npm run build
+if ($LASTEXITCODE -ne 0) {
+  throw "npm run build failed."
 }
 
-Write-Host "Preparing deployment package..." -ForegroundColor Cyan
-& $PackageScript @packageArgs
+if (Test-Path -LiteralPath $PackagePath) {
+  Remove-Item -LiteralPath $PackagePath -Force
+}
+
+$packageItems = @(
+  "server",
+  "src",
+  "dist",
+  "app.js",
+  "index.js",
+  "server.js",
+  "index.html",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "vite.config.ts",
+  "README.md"
+)
+
+if ($IncludeLocalData) {
+  $packageItems += "data"
+}
+
+Write-Host "Creating deployment package..." -ForegroundColor Cyan
+tar --format=ustar -czf $PackagePath @packageItems
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to create deployment package."
+}
 
 $sshIdentityArgs = @()
 $scpIdentityArgs = @()
@@ -49,65 +79,54 @@ if ($KeyPath) {
   $scpIdentityArgs += @("-i", $KeyPath)
 }
 
-$RemoteRoot = Escape-ShellSingleQuote $RemotePath
-$RemoteZip = "$RemotePath/$PackageName"
-$RemoteZipQuoted = Escape-ShellSingleQuote $RemoteZip
 $RemoteTarget = "${User}@${SshHost}"
-
-Write-Host "Creating remote directories..." -ForegroundColor Cyan
-& ssh @sshIdentityArgs -p $Port $RemoteTarget "mkdir -p $RemoteRoot/releases $RemoteRoot/shared/data"
+$RemotePackage = "$RemotePath/$PackageName"
+$RemotePathQuoted = Escape-ShellSingleQuote $RemotePath
+$RemotePackageQuoted = Escape-ShellSingleQuote $RemotePackage
 
 Write-Host "Uploading package to Hostinger..." -ForegroundColor Cyan
-& scp @scpIdentityArgs -P $Port $ZipPath "${RemoteTarget}:$RemoteZip"
+& scp @scpIdentityArgs -P $Port $PackagePath "${RemoteTarget}:$RemotePackage"
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to upload deployment package with SCP."
+}
 
 $RemoteScript = @"
 set -e
-ROOT=$RemoteRoot
-PACKAGE=$RemoteZipQuoted
+APP=$RemotePathQuoted
+PACKAGE=$RemotePackageQuoted
 STAMP=`$(date +%Y%m%d%H%M%S)
-RELEASE="`$ROOT/releases/`$STAMP"
+BACKUP="`$APP/.deploy-backup-`$STAMP"
 
-mkdir -p "`$ROOT/releases" "`$ROOT/shared/data"
-unzip -oq "`$PACKAGE" -d "`$RELEASE"
-
-if [ ! -f "`$ROOT/shared/data/forms.json" ]; then
-  if [ -f "`$RELEASE/data/forms.json" ]; then
-    cp "`$RELEASE/data/forms.json" "`$ROOT/shared/data/forms.json"
-  else
-    printf '{"forms":[],"responses":[],"webhookEvents":[]}' > "`$ROOT/shared/data/forms.json"
-  fi
+mkdir -p "`$BACKUP" "`$APP/data" "`$APP/tmp"
+if [ -d "`$APP/data" ]; then
+  cp -a "`$APP/data" "`$BACKUP/data"
 fi
 
-rm -rf "`$RELEASE/data"
-ln -s "`$ROOT/shared/data" "`$RELEASE/data"
+tar -xzf "`$PACKAGE" -C "`$APP"
 
-cd "`$RELEASE"
-npm install --omit=optional
-npm run build
-
-ln -sfn "`$RELEASE" "`$ROOT/current"
-
-if command -v pm2 >/dev/null 2>&1; then
-  cd "`$ROOT/current"
-  if pm2 describe mini-tally >/dev/null 2>&1; then
-    pm2 restart mini-tally --update-env
-  else
-    pm2 start server/index.js --name mini-tally --update-env
-  fi
-  pm2 save || true
-else
-  echo "pm2 not found. Release is ready at `$ROOT/current"
-  echo "Start command: cd `$ROOT/current && npm start"
+if [ -d "`$BACKUP/data" ] && [ "$IncludeLocalData" != "True" ]; then
+  rm -rf "`$APP/data"
+  cp -a "`$BACKUP/data" "`$APP/data"
 fi
 
-find "`$ROOT/releases" -mindepth 1 -maxdepth 1 -type d | sort | head -n -5 | xargs -r rm -rf
+mkdir -p "`$APP/data" "`$APP/tmp"
+if [ ! -f "`$APP/data/forms.json" ]; then
+  printf '{"forms":[],"responses":[],"webhookEvents":[]}' > "`$APP/data/forms.json"
+fi
+
+touch "`$APP/tmp/restart.txt"
+find "`$APP" -maxdepth 1 -type d -name '.deploy-backup-*' | sort | head -n -5 | xargs -r rm -rf
 "@
 
-Write-Host "Installing and activating release..." -ForegroundColor Cyan
+Write-Host "Installing release and restarting Hostinger Node app..." -ForegroundColor Cyan
 & ssh @sshIdentityArgs -p $Port $RemoteTarget $RemoteScript
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to install release on remote host."
+}
 
 if ($AppUrl) {
   Write-Host "Checking app URL..." -ForegroundColor Cyan
+  Start-Sleep -Seconds 2
   $response = Invoke-WebRequest -Uri $AppUrl -UseBasicParsing -TimeoutSec 30
   if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 400) {
     throw "Health check failed with status $($response.StatusCode): $AppUrl"

@@ -2,6 +2,7 @@ node_modules/
 dist/
 .deploy-hostinger/
 *.zip
+*.tar.gz
 
 # Local form data can contain submissions and uploaded file data.
 data/forms.json
