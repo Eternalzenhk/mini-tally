@@ -74,10 +74,12 @@ $env:HOSTINGER_PORT="65002"
 $env:HOSTINGER_PATH="/home/your-user/apps/mini-tally"
 $env:HOSTINGER_APP_URL="https://your-domain.com"
 $env:HOSTINGER_SSH_KEY="$env:USERPROFILE\.ssh\id_ed25519"
+$env:HOSTINGER_ADMIN_PASSWORD="your-admin-password"
+$env:HOSTINGER_PUBLIC_FORM_KEY="optional-public-form-id-or-slug"
 npm run deploy:hostinger
 ```
 
-The current SSH deploy script builds the app, uploads a `.tar.gz` release to the Hostinger Node.js app folder, preserves the remote `data` folder unless `-IncludeLocalData` is used, backs up the full `data` folder before release install, keeps the latest 7 backups, touches `tmp/restart.txt`, and optionally checks `HOSTINGER_APP_URL` plus `/api/auth/me`.
+The current SSH deploy script builds the app, uploads a `.tar.gz` release to the Hostinger Node.js app folder, preserves the remote `data` folder unless `-IncludeLocalData` is used, backs up the full `data` folder before release install, keeps the latest 7 backups, touches `tmp/restart.txt`, and optionally checks `HOSTINGER_APP_URL`, `/api/auth/me`, admin login + `/api/forms`, and a public form.
 
 Before deploying the protected workspace to Hostinger, make sure the Hostinger Node.js app has `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET`, and `NODE_ENV=production` configured. Otherwise the public forms will load, but the management workspace will not be ready for login from the public domain.
 
@@ -99,12 +101,15 @@ Before deploying the protected workspace to Hostinger, make sure the Hostinger N
 - Response and partial-submission CSV export
 - Theme editor and custom CSS
 - Webhook posting with optional HMAC signature
-- Webhook delivery log in the results workspace
+- Webhook delivery log and manual retry in the results workspace
 - Local data retention cleanup
 - SQLite storage with automatic legacy `forms.json` migration
 - File uploads stored under `data/uploads` with protected admin downloads
 - Result search, date filters, and paged response loading
 - Basic rate limits on admin login/setup and public submission endpoints
+- Form duplication
+- Form version history with restore
+- Admin activity log for form and response operations
 
 ## Local Limitations
 
@@ -118,7 +123,7 @@ Some Tally SaaS features need external services to be truly complete:
 
 ## Data
 
-Form definitions, submissions, partial submissions, answers, webhook logs, and admin config are stored in `data/mini-tally.sqlite`.
+Form definitions, submissions, partial submissions, answers, webhook logs, form versions, activity logs, and admin config are stored in `data/mini-tally.sqlite`.
 
 On first launch, if `data/mini-tally.sqlite` does not exist but `data/forms.json` exists, the server migrates the legacy JSON data into SQLite and creates a timestamped `data/forms.json.migrated-*.bak` backup. Existing public form URLs are preserved.
 

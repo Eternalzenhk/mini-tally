@@ -1,4 +1,4 @@
-import type { AuthState, Form, FormResponse, ResponsePage, WebhookEvent } from './types';
+import type { AuditEvent, AuthState, Form, FormResponse, FormVersion, ResponsePage, WebhookEvent } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -47,9 +47,18 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(form)
     }),
+  cloneForm: (id: string) =>
+    request<Form>(`/api/forms/${id}/clone`, {
+      method: 'POST'
+    }),
   deleteForm: (id: string) =>
     request<void>(`/api/forms/${id}`, {
       method: 'DELETE'
+    }),
+  listVersions: (id: string) => request<FormVersion[]>(`/api/forms/${id}/versions`),
+  restoreVersion: (id: string, versionId: string) =>
+    request<Form>(`/api/forms/${id}/versions/${versionId}/restore`, {
+      method: 'POST'
     }),
   submitResponse: (id: string, payload: { answers: FormResponse['answers']; clientId: string; password?: string; recaptcha?: string }) =>
     request<FormResponse>(`/api/forms/${id}/responses`, {
@@ -70,5 +79,16 @@ export const api = {
     });
     return request<ResponsePage>(`/api/forms/${id}/responses/page?${searchParams.toString()}`);
   },
-  listWebhooks: (id: string) => request<WebhookEvent[]>(`/api/forms/${id}/webhooks`)
+  listWebhooks: (id: string) => request<WebhookEvent[]>(`/api/forms/${id}/webhooks`),
+  retryWebhook: (id: string, eventId: string) =>
+    request<WebhookEvent>(`/api/forms/${id}/webhooks/${eventId}/retry`, {
+      method: 'POST'
+    }),
+  listAuditEvents: (params: { formId?: string; limit?: number } = {}) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== '') searchParams.set(key, String(value));
+    });
+    return request<AuditEvent[]>(`/api/audit-events?${searchParams.toString()}`);
+  }
 };

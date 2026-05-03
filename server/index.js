@@ -6,7 +6,12 @@ import { fileURLToPath } from 'node:url';
 import {
   ensureStore,
   getAttachment,
+  getFormVersion,
   getUploadAbsolutePath,
+  insertAuditEvent,
+  insertFormVersion,
+  listAuditEvents,
+  listFormVersions,
   materializeAnswers,
   readAdminConfig,
   readDb,
@@ -441,6 +446,21 @@ function normalizeForm(payload = {}, existing) {
   };
 }
 
+function cloneForm(source) {
+  const clonedId = id('form');
+  const cloned = JSON.parse(JSON.stringify(source));
+  cloned.id = clonedId;
+  cloned.title = `${source.title || 'Untitled form'} copy`.slice(0, 160);
+  cloned.published = false;
+  cloned.starred = false;
+  cloned.createdAt = now();
+  cloned.updatedAt = now();
+  cloned.settings = normalizeSettings({ ...source.settings, customSlug: '' });
+  cloned.theme = normalizeTheme(source.theme);
+  cloned.fields = Array.isArray(source.fields) ? source.fields.map(normalizeField) : [];
+  return cloned;
+}
+
 function migrateResponse(raw) {
   return {
     id: raw.id || id('resp'),
@@ -653,12 +673,13 @@ function applyRetention(db) {
   db.responses = keep;
 }
 
-async function sendWebhook(form, response) {
+async function sendWebhook(form, response, existingLog) {
   if (!form.settings.webhookUrl) return null;
+  const attemptAt = now();
   const event = {
-    eventId: id('evt'),
+    eventId: existingLog?.id || id('evt'),
     eventType: 'FORM_RESPONSE',
-    createdAt: now(),
+    createdAt: attemptAt,
     data: {
       responseId: response.id,
       formId: form.id,
@@ -668,7 +689,7 @@ async function sendWebhook(form, response) {
         key: field.key,
         label: field.label,
         type: field.type,
-        value: response.answers[field.id] ?? null
+        value: stripPrivateAttachmentData(response.answers[field.id] ?? null)
       }))
     }
   };
@@ -684,10 +705,12 @@ async function sendWebhook(form, response) {
     formId: form.id,
     responseId: response.id,
     url: form.settings.webhookUrl,
-    createdAt: event.createdAt,
+    createdAt: existingLog?.createdAt || attemptAt,
     ok: false,
     status: 0,
-    message: ''
+    message: '',
+    attempts: existingLog ? Math.max(1, Number(existingLog.attempts) || 1) + 1 : 1,
+    lastAttemptAt: attemptAt
   };
 
   try {
@@ -721,6 +744,10 @@ function formWebhookEvents(db, formId) {
     .filter((event) => event.formId === formId)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .slice(0, 100);
+}
+
+async function audit(action, { formId = '', targetId = '', message = '', metadata = {} } = {}) {
+  await insertAuditEvent({ action, formId, targetId, message, metadata, createdAt: now() });
 }
 
 app.get('/api/auth/me', async (req, res) => {
@@ -797,6 +824,8 @@ app.post('/api/forms', requireAdmin, async (req, res) => {
     return nextForm;
   });
   if (form.error) return res.status(form.status).json({ message: form.error });
+  await insertFormVersion(form, 'created');
+  await audit('form.created', { formId: form.id, targetId: form.id, message: `Created form "${form.title}"` });
   res.status(201).json(form);
 });
 
@@ -812,16 +841,81 @@ app.put('/api/forms/:id', requireAdmin, async (req, res) => {
     return nextForm;
   });
   if (form.error) return res.status(form.status).json({ message: form.error });
+  await insertFormVersion(form, 'updated');
+  await audit('form.updated', { formId: form.id, targetId: form.id, message: `Updated form "${form.title}"` });
   res.json(form);
 });
 
+app.post('/api/forms/:id/clone', requireAdmin, async (req, res) => {
+  const result = await updateDb((db) => {
+    const source = findForm(db, req.params.id);
+    if (!source) return { error: 'Form not found', status: 404 };
+    const cloned = cloneForm(source);
+    db.forms.push(cloned);
+    return { source, cloned };
+  });
+  if (result.error) return res.status(result.status).json({ message: result.error });
+  await insertFormVersion(result.cloned, 'cloned');
+  await audit('form.cloned', {
+    formId: result.cloned.id,
+    targetId: result.source.id,
+    message: `Cloned "${result.source.title}" to "${result.cloned.title}"`,
+    metadata: { sourceFormId: result.source.id }
+  });
+  res.status(201).json(result.cloned);
+});
+
 app.delete('/api/forms/:id', requireAdmin, async (req, res) => {
-  await updateDb((db) => {
+  const deleted = await updateDb((db) => {
+    const form = db.forms.find((item) => item.id === req.params.id);
     db.forms = db.forms.filter((item) => item.id !== req.params.id);
     db.responses = db.responses.filter((item) => item.formId !== req.params.id);
-    return null;
+    return form || null;
   });
+  if (deleted) await audit('form.deleted', { formId: deleted.id, targetId: deleted.id, message: `Deleted form "${deleted.title}"` });
   res.status(204).end();
+});
+
+app.get('/api/forms/:id/versions', requireAdmin, async (req, res) => {
+  const db = await readDb();
+  const form = findForm(db, req.params.id);
+  if (!form) return res.status(404).json({ message: 'Form not found' });
+  const versions = await listFormVersions(form.id);
+  res.json(versions.map(({ snapshot, ...version }) => ({
+    ...version,
+    title: snapshot?.title || '',
+    fieldCount: Array.isArray(snapshot?.fields) ? snapshot.fields.length : 0
+  })));
+});
+
+app.post('/api/forms/:id/versions/:versionId/restore', requireAdmin, async (req, res) => {
+  const version = await getFormVersion(req.params.id, req.params.versionId);
+  if (!version?.snapshot) return res.status(404).json({ message: 'Version not found' });
+  const form = await updateDb((db) => {
+    const index = db.forms.findIndex((item) => item.id === req.params.id);
+    if (index === -1) return { error: 'Form not found', status: 404 };
+    const restored = normalizeForm(
+      {
+        ...version.snapshot,
+        id: req.params.id,
+        settings: { ...version.snapshot.settings, customSlug: db.forms[index].settings.customSlug }
+      },
+      db.forms[index]
+    );
+    restored.createdAt = db.forms[index].createdAt;
+    restored.updatedAt = now();
+    db.forms[index] = restored;
+    return restored;
+  });
+  if (form.error) return res.status(form.status).json({ message: form.error });
+  await insertFormVersion(form, 'restored');
+  await audit('form.version_restored', {
+    formId: form.id,
+    targetId: version.id,
+    message: `Restored "${form.title}" from ${version.createdAt}`,
+    metadata: { versionId: version.id }
+  });
+  res.json(form);
 });
 
 app.post('/api/forms/:id/partials', submissionLimiter, async (req, res) => {
@@ -898,6 +992,12 @@ app.post('/api/forms/:id/responses', submissionLimiter, async (req, res) => {
   if (result.error) return res.status(result.status).json({ message: result.error });
   if (result.errors) return res.status(result.status).json({ errors: result.errors });
   res.status(result.status).json(publicResponse(result.response));
+  void audit('response.created', {
+    formId: result.response.formId,
+    targetId: result.response.id,
+    message: `New response ${result.response.id}`,
+    metadata: { clientId: result.response.clientId }
+  }).catch((error) => console.error('Audit log failed:', error));
   if (result.webhookForm) void sendWebhookInBackground(result.webhookForm, result.response);
 });
 
@@ -928,6 +1028,38 @@ app.get('/api/forms/:id/webhooks', requireAdmin, async (req, res) => {
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).json({ message: 'Form not found' });
   res.json(formWebhookEvents(db, form.id));
+});
+
+app.post('/api/forms/:id/webhooks/:eventId/retry', requireAdmin, async (req, res) => {
+  const db = await readDb();
+  const form = findForm(db, req.params.id);
+  if (!form) return res.status(404).json({ message: 'Form not found' });
+  const event = db.webhookEvents.find((item) => item.id === req.params.eventId && item.formId === form.id);
+  if (!event) return res.status(404).json({ message: 'Webhook event not found' });
+  const response = db.responses.find((item) => item.id === event.responseId && item.formId === form.id);
+  if (!response) return res.status(404).json({ message: 'Response not found' });
+  if (!form.settings.webhookUrl) return res.status(400).json({ message: 'Webhook URL is not configured' });
+
+  const result = await sendWebhook(form, response, event);
+  await updateDb((nextDb) => {
+    const eventIndex = nextDb.webhookEvents.findIndex((item) => item.id === event.id && item.formId === form.id);
+    if (eventIndex === -1) nextDb.webhookEvents.push(result);
+    else nextDb.webhookEvents[eventIndex] = result;
+    return null;
+  });
+  if (result.error) return res.status(result.status).json({ message: result.error });
+  await audit('webhook.retried', {
+    formId: result.formId,
+    targetId: result.id,
+    message: `Retried webhook ${result.id}`,
+    metadata: { ok: result.ok, status: result.status, attempts: result.attempts }
+  });
+  res.json(result);
+});
+
+app.get('/api/audit-events', requireAdmin, async (req, res) => {
+  const events = await listAuditEvents({ formId: String(req.query.formId || ''), limit: req.query.limit });
+  res.json(events);
 });
 
 app.get('/api/forms/:id/responses.csv', requireAdmin, async (req, res) => {

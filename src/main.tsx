@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   BarChart3,
   Check,
+  Copy,
   Clipboard,
   Code2,
   Download,
@@ -29,7 +30,7 @@ import {
   Workflow
 } from 'lucide-react';
 import { api } from './api';
-import type { AnswerValue, AuthState, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme, ResponsePage, WebhookEvent } from './types';
+import type { AnswerValue, AuditEvent, AuthState, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme, FormVersion, ResponsePage, WebhookEvent } from './types';
 import {
   absoluteEmbedUrl,
   absolutePublicUrl,
@@ -173,6 +174,16 @@ const text = {
     starredForm: 'Added to favorites',
     unstarredForm: 'Removed from favorites',
     deleteFormAction: 'Delete form',
+    duplicateForm: 'Duplicate form',
+    formDuplicated: 'Form duplicated',
+    versionsTitle: 'Version history',
+    auditTitle: 'Activity log',
+    restoreVersion: 'Restore',
+    versionRestored: 'Version restored',
+    noVersions: 'No versions yet.',
+    noAuditEvents: 'No activity yet.',
+    retryWebhook: 'Retry',
+    webhookRetried: 'Webhook retried',
     adminTitle: 'Admin access',
     setupAdmin: 'Create admin password',
     loginAdmin: 'Log in',
@@ -302,6 +313,16 @@ const text = {
     starredForm: '已加入收藏',
     unstarredForm: '已取消收藏',
     deleteFormAction: '刪除表單',
+    duplicateForm: '複製表單',
+    formDuplicated: '已複製表單',
+    versionsTitle: '版本歷史',
+    auditTitle: '操作紀錄',
+    restoreVersion: '還原',
+    versionRestored: '已還原版本',
+    noVersions: '還沒有版本紀錄。',
+    noAuditEvents: '還沒有操作紀錄。',
+    retryWebhook: '重試',
+    webhookRetried: 'Webhook 已重試',
     adminTitle: '管理員登入',
     setupAdmin: '建立管理員密碼',
     loginAdmin: '登入',
@@ -664,6 +685,13 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
     await loadForms();
   }
 
+  async function duplicateForm(form: Form) {
+    const cloned = await api.cloneForm(form.id);
+    await loadForms(cloned.id);
+    setTab('build');
+    setStatus(t.formDuplicated);
+  }
+
   async function toggleFavorite(form: Form) {
     const nextForm = { ...form, starred: !form.starred };
     const saved = await api.updateForm(form.id, nextForm);
@@ -740,6 +768,15 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
                 </button>
                 <button
                   type="button"
+                  className="list-action-btn"
+                  title={t.duplicateForm}
+                  aria-label={t.duplicateForm}
+                  onClick={() => void duplicateForm(form)}
+                >
+                  <Copy size={15} />
+                </button>
+                <button
+                  type="button"
                   className="list-action-btn danger"
                   title={lang === 'zh' ? '刪除表單' : 'Delete form'}
                   aria-label={lang === 'zh' ? '刪除表單' : 'Delete form'}
@@ -798,6 +835,7 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
               partials={partials}
               responsePage={responsePage}
               partialPage={partialPage}
+              reloadResponses={() => loadResponses(draft.id)}
               onResponsesChange={(page) => {
                 setResponsePage(page);
                 setResponses(page.items);
@@ -809,7 +847,18 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
               reload={() => loadResponses(draft.id)}
             />
           )}
-          {tab === 'settings' && <SettingsPanel form={draft} updateDraft={updateDraft} saveDraft={saveDraft} />}
+          {tab === 'settings' && (
+            <SettingsPanel
+              form={draft}
+              updateDraft={updateDraft}
+              saveDraft={saveDraft}
+              onRestore={(restored) => {
+                setDraft(restored);
+                setForms((current) => current.map((item) => (item.id === restored.id ? { ...restored, responseCount: item.responseCount, partialCount: item.partialCount } : item)));
+                setStatus(t.versionRestored);
+              }}
+            />
+          )}
 
           <div className="status-bar">
             <span>{status}</span>
@@ -1375,6 +1424,7 @@ function ResultsPanel({
   partials,
   responsePage,
   partialPage,
+  reloadResponses,
   onResponsesChange,
   onPartialsChange,
   reload
@@ -1384,6 +1434,7 @@ function ResultsPanel({
   partials: FormResponse[];
   responsePage: ResponsePage | null;
   partialPage: ResponsePage | null;
+  reloadResponses: () => Promise<void>;
   onResponsesChange: (page: ResponsePage) => void;
   onPartialsChange: (page: ResponsePage) => void;
   reload: () => void;
@@ -1470,7 +1521,15 @@ function ResultsPanel({
 
       <ResponseTable title={t.responseTitle} form={form} responses={responses} page={responsePage} empty={t.noResponses} onPage={(page) => void loadPage('complete', page)} />
       <ResponseTable title={t.partialTitle} form={form} responses={partials} page={partialPage} empty={t.noPartials} onPage={(page) => void loadPage('partial', page)} />
-      <WebhookLog events={webhooks} />
+      <WebhookLog
+        events={webhooks}
+        retry={async (eventId) => {
+          await api.retryWebhook(form.id, eventId);
+          const events = await api.listWebhooks(form.id);
+          setWebhooks(events);
+          await reloadResponses();
+        }}
+      />
     </section>
   );
 }
@@ -1548,8 +1607,17 @@ function ResponseTable({
   );
 }
 
-function WebhookLog({ events }: { events: WebhookEvent[] }) {
+function WebhookLog({ events, retry }: { events: WebhookEvent[]; retry: (eventId: string) => Promise<void> }) {
   const { t } = useI18n();
+  const [retrying, setRetrying] = useState('');
+  async function retryEvent(eventId: string) {
+    setRetrying(eventId);
+    try {
+      await retry(eventId);
+    } finally {
+      setRetrying('');
+    }
+  }
   return (
     <div className="results-section">
       <div className="results-section-head">
@@ -1563,8 +1631,16 @@ function WebhookLog({ events }: { events: WebhookEvent[] }) {
             <div className="webhook-log-row" key={event.id}>
               <span className={event.ok ? 'status-pill ok' : 'status-pill failed'}>{event.ok ? 'OK' : 'Failed'}</span>
               <strong>{event.status || '-'}</strong>
-              <span>{event.message || t.webhookStatus}</span>
-              <time>{formatDate(event.createdAt)}</time>
+              <span>
+                {event.message || t.webhookStatus}
+                {event.attempts ? <small> · {event.attempts}</small> : null}
+              </span>
+              <time>{formatDate(event.lastAttemptAt || event.createdAt)}</time>
+              {!event.ok && (
+                <button className="text-button compact-action" type="button" disabled={retrying === event.id} onClick={() => void retryEvent(event.id)}>
+                  {t.retryWebhook}
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -1598,15 +1674,46 @@ function renderAnswer(value: AnswerValue, downloadLabel: string): React.ReactNod
 function SettingsPanel({
   form,
   updateDraft,
-  saveDraft
+  saveDraft,
+  onRestore
 }: {
   form: Form;
   updateDraft: (updater: (current: Form) => Form) => void;
   saveDraft: (nextDraft?: Form | null) => void;
+  onRestore: (form: Form) => void;
 }) {
   const { t } = useI18n();
+  const [versions, setVersions] = useState<FormVersion[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([api.listVersions(form.id), api.listAuditEvents({ formId: form.id, limit: 50 })])
+      .then(([nextVersions, nextAuditEvents]) => {
+        if (cancelled) return;
+        setVersions(nextVersions);
+        setAuditEvents(nextAuditEvents);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setVersions([]);
+        setAuditEvents([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.id, form.updatedAt]);
+
   function updateSettings(patch: Partial<FormSettings>) {
     updateDraft((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
+  }
+
+  async function restoreVersion(versionId: string) {
+    const restored = await api.restoreVersion(form.id, versionId);
+    onRestore(restored);
+    const [nextVersions, nextAuditEvents] = await Promise.all([api.listVersions(restored.id), api.listAuditEvents({ formId: restored.id, limit: 50 })]);
+    setVersions(nextVersions);
+    setAuditEvents(nextAuditEvents);
   }
 
   return (
@@ -1661,7 +1768,76 @@ function SettingsPanel({
         {t.redirectUrl}
         <input value={form.settings.redirectUrl} onChange={(event) => updateSettings({ redirectUrl: event.target.value })} onBlur={() => saveDraft()} />
       </label>
+      <OperationalHistory versions={versions} auditEvents={auditEvents} restore={restoreVersion} />
     </section>
+  );
+}
+
+function OperationalHistory({
+  versions,
+  auditEvents,
+  restore
+}: {
+  versions: FormVersion[];
+  auditEvents: AuditEvent[];
+  restore: (versionId: string) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [restoring, setRestoring] = useState('');
+  async function restoreOne(versionId: string) {
+    setRestoring(versionId);
+    try {
+      await restore(versionId);
+    } finally {
+      setRestoring('');
+    }
+  }
+  return (
+    <div className="ops-grid">
+      <section className="ops-panel">
+        <div className="results-section-head">
+          <h3>{t.versionsTitle}</h3>
+        </div>
+        {versions.length === 0 ? (
+          <div className="quiet-empty small">{t.noVersions}</div>
+        ) : (
+          <div className="ops-list">
+            {versions.map((version) => (
+              <div className="ops-row" key={version.id}>
+                <span>
+                  <strong>{version.action}</strong>
+                  <small>{version.title} · {version.fieldCount} {t.fields}</small>
+                </span>
+                <time>{formatDate(version.createdAt)}</time>
+                <button className="text-button compact-action" type="button" disabled={restoring === version.id} onClick={() => void restoreOne(version.id)}>
+                  {t.restoreVersion}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+      <section className="ops-panel">
+        <div className="results-section-head">
+          <h3>{t.auditTitle}</h3>
+        </div>
+        {auditEvents.length === 0 ? (
+          <div className="quiet-empty small">{t.noAuditEvents}</div>
+        ) : (
+          <div className="ops-list">
+            {auditEvents.map((event) => (
+              <div className="ops-row audit" key={event.id}>
+                <span>
+                  <strong>{event.action}</strong>
+                  <small>{event.message}</small>
+                </span>
+                <time>{formatDate(event.createdAt)}</time>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
   );
 }
 

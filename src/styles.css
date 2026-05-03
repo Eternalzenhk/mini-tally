@@ -1155,7 +1155,7 @@ a {
 
 .webhook-log-row {
   display: grid;
-  grid-template-columns: auto 58px minmax(0, 1fr) auto;
+  grid-template-columns: auto 58px minmax(0, 1fr) auto auto;
   gap: 12px;
   align-items: center;
   padding: 12px 14px;
@@ -1173,6 +1173,74 @@ a {
 }
 
 .webhook-log-row time {
+  white-space: nowrap;
+}
+
+.compact-action {
+  width: auto;
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 0.8rem;
+}
+
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 22px;
+}
+
+.ops-panel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ops-list {
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.ops-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ops-row.audit {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.ops-row:last-child {
+  border-bottom: 0;
+}
+
+.ops-row span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.ops-row strong {
+  color: var(--text);
+}
+
+.ops-row small {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ops-row time {
+  color: var(--muted);
+  font-size: 0.82rem;
   white-space: nowrap;
 }
 
@@ -1465,7 +1533,8 @@ a {
   .settings-grid,
   .share-grid,
   .metrics-row,
-  .toggle-grid {
+  .toggle-grid,
+  .ops-grid {
     grid-template-columns: 1fr;
   }
 

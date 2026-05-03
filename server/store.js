@@ -127,6 +127,26 @@ async function initializeStore() {
       ok INTEGER NOT NULL DEFAULT 0,
       status INTEGER NOT NULL DEFAULT 0,
       message TEXT NOT NULL DEFAULT '',
+      attempts INTEGER NOT NULL DEFAULT 1,
+      last_attempt_at TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS form_versions (
+      id TEXT PRIMARY KEY,
+      form_id TEXT NOT NULL,
+      action TEXT NOT NULL DEFAULT '',
+      snapshot_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_events (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      form_id TEXT NOT NULL DEFAULT '',
+      target_id TEXT NOT NULL DEFAULT '',
+      message TEXT NOT NULL DEFAULT '',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL
     );
 
@@ -141,10 +161,20 @@ async function initializeStore() {
     CREATE INDEX IF NOT EXISTS idx_fields_form_sort ON fields(form_id, sort_order);
     CREATE INDEX IF NOT EXISTS idx_responses_form_status_created ON responses(form_id, status, created_at);
     CREATE INDEX IF NOT EXISTS idx_attachments_response ON attachments(response_id);
+    CREATE INDEX IF NOT EXISTS idx_form_versions_form_created ON form_versions(form_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_audit_events_form_created ON audit_events(form_id, created_at);
   `);
+  ensureColumn('webhook_events', 'attempts', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('webhook_events', 'last_attempt_at', 'TEXT');
 
   await migrateLegacyFormsIfNeeded();
   await migrateLegacyAdminIfNeeded();
+}
+
+function ensureColumn(table, column, definition) {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all();
+  if (columns.some((item) => item.name === column)) return;
+  database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 async function migrateLegacyFormsIfNeeded() {
@@ -240,6 +270,78 @@ export async function getAttachment(id) {
     .get(id);
 }
 
+export async function insertFormVersion(form, action = 'saved') {
+  await ensureStore();
+  database
+    .prepare('INSERT INTO form_versions (id, form_id, action, snapshot_json, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(id('ver'), form.id, action, stringifyJson(form), now());
+}
+
+export async function listFormVersions(formId, limit = 30) {
+  await ensureStore();
+  return database
+    .prepare('SELECT id, form_id AS formId, action, snapshot_json AS snapshotJson, created_at AS createdAt FROM form_versions WHERE form_id = ? ORDER BY created_at DESC LIMIT ?')
+    .all(formId, Math.max(1, Math.min(100, Number(limit) || 30)))
+    .map((row) => ({
+      id: row.id,
+      formId: row.formId,
+      action: row.action || '',
+      snapshot: parseJson(row.snapshotJson, null),
+      createdAt: row.createdAt
+    }));
+}
+
+export async function getFormVersion(formId, versionId) {
+  await ensureStore();
+  const row = database
+    .prepare('SELECT id, form_id AS formId, action, snapshot_json AS snapshotJson, created_at AS createdAt FROM form_versions WHERE form_id = ? AND id = ?')
+    .get(formId, versionId);
+  if (!row) return null;
+  return {
+    id: row.id,
+    formId: row.formId,
+    action: row.action || '',
+    snapshot: parseJson(row.snapshotJson, null),
+    createdAt: row.createdAt
+  };
+}
+
+export async function insertAuditEvent(event) {
+  await ensureStore();
+  database
+    .prepare('INSERT INTO audit_events (id, action, form_id, target_id, message, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(
+      event.id || id('aud'),
+      event.action || 'event',
+      event.formId || '',
+      event.targetId || '',
+      event.message || '',
+      stringifyJson(event.metadata || {}),
+      event.createdAt || now()
+    );
+}
+
+export async function listAuditEvents({ formId = '', limit = 100 } = {}) {
+  await ensureStore();
+  const cappedLimit = Math.max(1, Math.min(200, Number(limit) || 100));
+  const rows = formId
+    ? database
+        .prepare('SELECT id, action, form_id AS formId, target_id AS targetId, message, metadata_json AS metadataJson, created_at AS createdAt FROM audit_events WHERE form_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(formId, cappedLimit)
+    : database
+        .prepare('SELECT id, action, form_id AS formId, target_id AS targetId, message, metadata_json AS metadataJson, created_at AS createdAt FROM audit_events ORDER BY created_at DESC LIMIT ?')
+        .all(cappedLimit);
+  return rows.map((row) => ({
+    id: row.id,
+    action: row.action,
+    formId: row.formId || '',
+    targetId: row.targetId || '',
+    message: row.message || '',
+    metadata: parseJson(row.metadataJson, {}),
+    createdAt: row.createdAt
+  }));
+}
+
 function readDbFromSqlite() {
   const forms = database
     .prepare('SELECT id, title, description, published, starred, settings_json, theme_json, created_at, updated_at FROM forms ORDER BY updated_at DESC')
@@ -293,7 +395,7 @@ function readDbFromSqlite() {
     });
 
   const webhookEvents = database
-    .prepare('SELECT id, form_id, response_id, url, ok, status, message, created_at FROM webhook_events ORDER BY created_at DESC')
+    .prepare('SELECT id, form_id, response_id, url, ok, status, message, attempts, last_attempt_at, created_at FROM webhook_events ORDER BY created_at DESC')
     .all()
     .map((row) => ({
       id: row.id,
@@ -303,6 +405,8 @@ function readDbFromSqlite() {
       ok: Boolean(row.ok),
       status: Number(row.status) || 0,
       message: row.message || '',
+      attempts: Number(row.attempts) || 1,
+      lastAttemptAt: row.last_attempt_at || row.created_at,
       createdAt: row.created_at
     }));
 
@@ -334,8 +438,8 @@ function writeDbToSqlite(data) {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertWebhook = database.prepare(
-      `INSERT INTO webhook_events (id, form_id, response_id, url, ok, status, message, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO webhook_events (id, form_id, response_id, url, ok, status, message, attempts, last_attempt_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     for (const form of nextData.forms || []) {
@@ -397,7 +501,18 @@ function writeDbToSqlite(data) {
     }
 
     for (const event of nextData.webhookEvents || []) {
-      insertWebhook.run(event.id, event.formId || '', event.responseId || '', event.url || '', event.ok ? 1 : 0, Number(event.status) || 0, event.message || '', event.createdAt || now());
+      insertWebhook.run(
+        event.id,
+        event.formId || '',
+        event.responseId || '',
+        event.url || '',
+        event.ok ? 1 : 0,
+        Number(event.status) || 0,
+        event.message || '',
+        Math.max(1, Number(event.attempts) || 1),
+        event.lastAttemptAt || event.createdAt || now(),
+        event.createdAt || now()
+      );
     }
   }, data || { forms: [], responses: [], webhookEvents: [] });
 }

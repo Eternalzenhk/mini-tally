@@ -139,5 +139,26 @@ export type WebhookEvent = {
   ok: boolean;
   status: number;
   message: string;
+  attempts?: number;
+  lastAttemptAt?: string;
+  createdAt: string;
+};
+
+export type FormVersion = {
+  id: string;
+  formId: string;
+  action: string;
+  title: string;
+  fieldCount: number;
+  createdAt: string;
+};
+
+export type AuditEvent = {
+  id: string;
+  action: string;
+  formId: string;
+  targetId: string;
+  message: string;
+  metadata: Record<string, unknown>;
   createdAt: string;
 };
