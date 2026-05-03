@@ -12,6 +12,24 @@ npm run server
 
 Open http://127.0.0.1:4177.
 
+The management workspace is protected by an admin password. On first local run, open the app from `localhost` or `127.0.0.1` and create the password on screen. The public `/form/...` links still work without admin login.
+
+## Admin Security
+
+Management APIs, form editing, results, partial submissions, and CSV exports require an admin session. Public form loading and public submissions remain open for respondents.
+
+For production hosting, set these environment variables before the first deploy:
+
+```bash
+ADMIN_PASSWORD="use-a-long-private-password"
+ADMIN_SESSION_SECRET="use-a-long-random-secret"
+NODE_ENV="production"
+```
+
+`ADMIN_PASSWORD` lets you log in without creating a local `data/admin.json` file. `ADMIN_SESSION_SECRET` keeps admin sessions valid after restarts. If you prefer the setup screen on a server, temporarily set `ALLOW_ADMIN_SETUP=true`, create the password immediately, then remove that variable.
+
+Never commit `data/admin.json` or `data/forms.json`. They can contain password hashes, submissions, and uploaded file data.
+
 ## Hostinger Deployment
 
 This app needs Hostinger Node.js hosting, not static file hosting, because it has an Express API and stores form data in `data/forms.json`.
@@ -57,7 +75,9 @@ $env:HOSTINGER_SSH_KEY="$env:USERPROFILE\.ssh\id_ed25519"
 npm run deploy:hostinger
 ```
 
-The SSH deploy script builds the app, uploads a release package, keeps `data/forms.json` in a shared folder, activates the new release, restarts `pm2` when available, and optionally checks `HOSTINGER_APP_URL`.
+The current SSH deploy script builds the app, uploads a `.tar.gz` release to the Hostinger Node.js app folder, preserves the remote `data` folder unless `-IncludeLocalData` is used, touches `tmp/restart.txt`, and optionally checks `HOSTINGER_APP_URL`.
+
+Before deploying the protected workspace to Hostinger, make sure the Hostinger Node.js app has `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET`, and `NODE_ENV=production` configured. Otherwise the public forms will load, but the management workspace will not be ready for login from the public domain.
 
 ## Implemented
 

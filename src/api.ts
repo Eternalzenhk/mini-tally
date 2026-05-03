@@ -1,7 +1,8 @@
-import type { Form, FormResponse } from './types';
+import type { AuthState, Form, FormResponse } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
+    credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
       ...options?.headers
@@ -19,8 +20,23 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  authState: () => request<AuthState>('/api/auth/me'),
+  setupAdmin: (password: string) =>
+    request<{ ok: true }>('/api/auth/setup', {
+      method: 'POST',
+      body: JSON.stringify({ password })
+    }),
+  login: (password: string) =>
+    request<{ ok: true }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ password })
+    }),
+  logout: () =>
+    request<void>('/api/auth/logout', {
+      method: 'POST'
+    }),
   listForms: () => request<Form[]>('/api/forms'),
-  getForm: (id: string) => request<Form>(`/api/forms/${id}`),
+  getPublicForm: (id: string) => request<Form>(`/api/public/forms/${id}`),
   createForm: (form: Partial<Form>) =>
     request<Form>('/api/forms', {
       method: 'POST',

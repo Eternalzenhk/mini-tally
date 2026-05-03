@@ -181,7 +181,7 @@ export function displayAnswer(value: AnswerValue): string {
       .join(', ');
   }
   if (typeof value === 'object') {
-    if ('name' in value && 'size' in value) return `${value.name} (${Math.round(value.size / 1024)} KB)`;
+    if ('name' in value && 'size' in value) return `${String(value.name)} (${Math.round(Number(value.size) / 1024)} KB)`;
     return Object.entries(value)
       .map(([key, item]) => `${key}: ${item}`)
       .join('; ');

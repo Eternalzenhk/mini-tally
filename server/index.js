@@ -8,10 +8,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.basename(path.resolve(__dirname, '..')) === 'dist' ? path.resolve(__dirname, '..', '..') : path.resolve(__dirname, '..');
 const dataDir = path.join(rootDir, 'data');
 const dbPath = path.join(dataDir, 'forms.json');
+const adminConfigPath = path.join(dataDir, 'admin.json');
 const distDir = path.basename(rootDir) === 'dist' ? rootDir : path.join(rootDir, 'dist');
 const app = express();
 const port = Number(process.env.PORT || 4177);
 const listenHost = process.env.LISTEN_HOST || '0.0.0.0';
+const adminCookieName = 'mini_tally_admin';
+const adminSessionSecret = process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const adminSessionTtlMs = 7 * 24 * 60 * 60 * 1000;
 
 const fieldTypes = [
   'short_text',
@@ -103,8 +107,30 @@ async function readDb() {
   };
 }
 
+async function writeJsonAtomic(filePath, value) {
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify(value, null, 2));
+  await fs.rename(tmpPath, filePath);
+}
+
 async function writeDb(db) {
-  await fs.writeFile(dbPath, JSON.stringify(db, null, 2));
+  await writeJsonAtomic(dbPath, db);
+}
+
+let dbQueue = Promise.resolve();
+
+function updateDb(mutator) {
+  const next = dbQueue.then(async () => {
+    const db = await readDb();
+    const result = await mutator(db);
+    await writeDb(db);
+    return result;
+  });
+  dbQueue = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
 }
 
 function now() {
@@ -113,6 +139,168 @@ function now() {
 
 function id(prefix) {
   return `${prefix}_${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-5)}`;
+}
+
+function parseCookies(header = '') {
+  return Object.fromEntries(
+    String(header)
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const index = part.indexOf('=');
+        if (index === -1) return [part, ''];
+        try {
+          return [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+        } catch {
+          return [part.slice(0, index), ''];
+        }
+      })
+  );
+}
+
+function signSession(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', adminSessionSecret).update(body).digest('base64url');
+  return `${body}.${signature}`;
+}
+
+function verifySession(token) {
+  const [body, signature] = String(token || '').split('.');
+  if (!body || !signature) return false;
+  const expected = crypto.createHmac('sha256', adminSessionSecret).update(body).digest('base64url');
+  if (
+    expected.length !== signature.length ||
+    !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+  ) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return payload.role === 'admin' && Number(payload.exp) > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function cookieOptions(maxAgeSeconds) {
+  const secure = process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true';
+  return [
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${maxAgeSeconds}`,
+    secure ? 'Secure' : ''
+  ]
+    .filter(Boolean)
+    .join('; ');
+}
+
+async function readAdminConfig() {
+  await fs.mkdir(dataDir, { recursive: true });
+  try {
+    const raw = (await fs.readFile(adminConfigPath, 'utf8')).replace(/^\uFEFF/, '');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeAdminConfig(config) {
+  await fs.mkdir(dataDir, { recursive: true });
+  await writeJsonAtomic(adminConfigPath, config);
+}
+
+async function adminState() {
+  const hasEnvPassword = Boolean(process.env.ADMIN_PASSWORD);
+  const config = await readAdminConfig();
+  return {
+    configured: hasEnvPassword || Boolean(config?.passwordHash),
+    source: hasEnvPassword ? 'env' : config?.passwordHash ? 'local' : ''
+  };
+}
+
+async function hashPassword(password, salt = crypto.randomBytes(16).toString('base64url')) {
+  const hash = await new Promise((resolve, reject) => {
+    crypto.scrypt(String(password), salt, 64, (error, key) => {
+      if (error) reject(error);
+      else resolve(key.toString('base64url'));
+    });
+  });
+  return `scrypt:${salt}:${hash}`;
+}
+
+async function verifyPassword(password, storedHash) {
+  const [method, salt, hash] = String(storedHash || '').split(':');
+  if (method !== 'scrypt' || !salt || !hash) return false;
+  const nextHash = await hashPassword(password, salt);
+  const expected = Buffer.from(storedHash);
+  const actual = Buffer.from(nextHash);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+async function isAdminPassword(password) {
+  if (process.env.ADMIN_PASSWORD) {
+    const actual = Buffer.from(String(password || ''));
+    const expected = Buffer.from(process.env.ADMIN_PASSWORD);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  }
+  const config = await readAdminConfig();
+  return verifyPassword(password, config?.passwordHash);
+}
+
+function hasAdminSession(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  return verifySession(cookies[adminCookieName]);
+}
+
+function requireAdmin(req, res, next) {
+  if (hasAdminSession(req)) return next();
+  return res.status(401).json({ message: 'Admin login required' });
+}
+
+function publicForm(form) {
+  return {
+    ...form,
+    settings: {
+      ...form.settings,
+      password: form.settings.password ? '__protected__' : '',
+      webhookUrl: '',
+      webhookSecret: '',
+      emailNotifications: ''
+    }
+  };
+}
+
+function isLocalAddress(value) {
+  return value === '127.0.0.1' || value === '::1' || value === '::ffff:127.0.0.1';
+}
+
+function hostNameFromHeader(value) {
+  const host = String(value || '').trim().toLowerCase();
+  if (!host) return '';
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']');
+    return end === -1 ? host.slice(1) : host.slice(1, end);
+  }
+  const parts = host.split(':');
+  return parts.length === 2 ? parts[0] : host;
+}
+
+function isLocalHost(value) {
+  const host = hostNameFromHeader(value);
+  return host === 'localhost' || isLocalAddress(host);
+}
+
+function canRunSetup(req) {
+  if (process.env.ALLOW_ADMIN_SETUP === 'true') return true;
+  if (process.env.NODE_ENV === 'production') return false;
+  const remote = req.socket.remoteAddress || '';
+  return isLocalAddress(remote) && isLocalHost(req.headers.host);
+}
+
+function setAdminCookie(res, token, maxAgeSeconds) {
+  res.setHeader('Set-Cookie', `${adminCookieName}=${encodeURIComponent(token)}; ${cookieOptions(maxAgeSeconds)}`);
 }
 
 function mapLegacyType(type) {
@@ -467,142 +655,210 @@ async function sendWebhook(form, response) {
   return log;
 }
 
-app.get('/api/forms', async (_req, res) => {
+async function sendWebhookInBackground(form, response) {
+  if (!form.settings.webhookUrl) return;
+  try {
+    const webhookLog = await sendWebhook(form, response);
+    if (!webhookLog) return;
+    await updateDb((db) => {
+      db.webhookEvents.push(webhookLog);
+      return null;
+    });
+  } catch (error) {
+    console.error('Webhook delivery failed:', error);
+  }
+}
+
+app.get('/api/auth/me', async (req, res) => {
+  const state = await adminState();
+  res.json({
+    configured: state.configured,
+    authenticated: hasAdminSession(req),
+    setupAllowed: !state.configured && canRunSetup(req)
+  });
+});
+
+app.post('/api/auth/setup', async (req, res) => {
+  const state = await adminState();
+  if (state.configured) return res.status(409).json({ message: 'Admin password is already configured' });
+  if (!canRunSetup(req)) return res.status(403).json({ message: 'Set ADMIN_PASSWORD or enable setup from the server console' });
+  const password = String(req.body.password || '');
+  if (password.length < 10) return res.status(400).json({ message: 'Use at least 10 characters' });
+
+  await writeAdminConfig({ passwordHash: await hashPassword(password), createdAt: now() });
+  const token = signSession({ role: 'admin', exp: Date.now() + adminSessionTtlMs });
+  setAdminCookie(res, token, Math.floor(adminSessionTtlMs / 1000));
+  res.status(201).json({ ok: true });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const state = await adminState();
+  if (!state.configured) return res.status(409).json({ message: 'Admin password is not configured' });
+  if (!(await isAdminPassword(req.body.password))) return res.status(401).json({ message: 'Incorrect password' });
+
+  const token = signSession({ role: 'admin', exp: Date.now() + adminSessionTtlMs });
+  setAdminCookie(res, token, Math.floor(adminSessionTtlMs / 1000));
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/logout', (_req, res) => {
+  setAdminCookie(res, '', 0);
+  res.status(204).end();
+});
+
+app.get('/api/public/forms/:id', async (req, res) => {
   const db = await readDb();
-  applyRetention(db);
-  const forms = db.forms.map((form) => ({
-    ...form,
-    responseCount: db.responses.filter((response) => response.formId === form.id && response.status === 'complete').length,
-    partialCount: db.responses.filter((response) => response.formId === form.id && response.status === 'partial').length
-  }));
-  await writeDb(db);
+  const form = findForm(db, req.params.id);
+  if (!form || !form.published) return res.status(404).json({ message: 'Form not found' });
+  res.json(publicForm(form));
+});
+
+app.get('/api/forms', requireAdmin, async (_req, res) => {
+  const forms = await updateDb((db) => {
+    applyRetention(db);
+    return db.forms.map((form) => ({
+      ...form,
+      responseCount: db.responses.filter((response) => response.formId === form.id && response.status === 'complete').length,
+      partialCount: db.responses.filter((response) => response.formId === form.id && response.status === 'partial').length
+    }));
+  });
   res.json(forms.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
 });
 
-app.get('/api/forms/:id', async (req, res) => {
+app.get('/api/forms/:id', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).json({ message: 'Form not found' });
   res.json(form);
 });
 
-app.post('/api/forms', async (req, res) => {
-  const db = await readDb();
-  const form = normalizeForm(req.body);
-  if (form.settings.customSlug && db.forms.some((item) => publicKey(item) === form.settings.customSlug)) {
-    return res.status(409).json({ message: 'Slug already exists' });
-  }
-  db.forms.push(form);
-  await writeDb(db);
+app.post('/api/forms', requireAdmin, async (req, res) => {
+  const form = await updateDb((db) => {
+    const nextForm = normalizeForm(req.body);
+    if (nextForm.settings.customSlug && db.forms.some((item) => publicKey(item) === nextForm.settings.customSlug)) {
+      return { error: 'Slug already exists', status: 409 };
+    }
+    db.forms.push(nextForm);
+    return nextForm;
+  });
+  if (form.error) return res.status(form.status).json({ message: form.error });
   res.status(201).json(form);
 });
 
-app.put('/api/forms/:id', async (req, res) => {
-  const db = await readDb();
-  const index = db.forms.findIndex((item) => item.id === req.params.id);
-  if (index === -1) return res.status(404).json({ message: 'Form not found' });
-  const form = normalizeForm({ ...req.body, id: req.params.id }, db.forms[index]);
-  if (form.settings.customSlug && db.forms.some((item) => item.id !== form.id && publicKey(item) === form.settings.customSlug)) {
-    return res.status(409).json({ message: 'Slug already exists' });
-  }
-  db.forms[index] = form;
-  await writeDb(db);
+app.put('/api/forms/:id', requireAdmin, async (req, res) => {
+  const form = await updateDb((db) => {
+    const index = db.forms.findIndex((item) => item.id === req.params.id);
+    if (index === -1) return { error: 'Form not found', status: 404 };
+    const nextForm = normalizeForm({ ...req.body, id: req.params.id }, db.forms[index]);
+    if (nextForm.settings.customSlug && db.forms.some((item) => item.id !== nextForm.id && publicKey(item) === nextForm.settings.customSlug)) {
+      return { error: 'Slug already exists', status: 409 };
+    }
+    db.forms[index] = nextForm;
+    return nextForm;
+  });
+  if (form.error) return res.status(form.status).json({ message: form.error });
   res.json(form);
 });
 
-app.delete('/api/forms/:id', async (req, res) => {
-  const db = await readDb();
-  db.forms = db.forms.filter((item) => item.id !== req.params.id);
-  db.responses = db.responses.filter((item) => item.formId !== req.params.id);
-  await writeDb(db);
+app.delete('/api/forms/:id', requireAdmin, async (req, res) => {
+  await updateDb((db) => {
+    db.forms = db.forms.filter((item) => item.id !== req.params.id);
+    db.responses = db.responses.filter((item) => item.formId !== req.params.id);
+    return null;
+  });
   res.status(204).end();
 });
 
 app.post('/api/forms/:id/partials', async (req, res) => {
-  const db = await readDb();
-  const form = findForm(db, req.params.id);
-  if (!form || !form.published || !form.settings.partialSubmissions) return res.status(404).json({ message: 'Partial submissions disabled' });
-  const answers = calculateFields(form, req.body.answers || {});
-  const clientId = String(req.body.clientId || '');
-  if (!clientId || Object.keys(answers).length === 0) return res.status(204).end();
+  const result = await updateDb((db) => {
+    const form = findForm(db, req.params.id);
+    if (!form || !form.published || !form.settings.partialSubmissions) return { error: 'Partial submissions disabled', status: 404 };
+    const answers = calculateFields(form, req.body.answers || {});
+    const clientId = String(req.body.clientId || '');
+    if (!clientId || Object.keys(answers).length === 0) return { empty: true };
 
-  const existing = db.responses.find((item) => item.formId === form.id && item.clientId === clientId && item.status === 'partial');
-  if (existing) {
-    existing.answers = { ...existing.answers, ...answers };
-    existing.updatedAt = now();
-    await writeDb(db);
-    return res.json(existing);
-  }
+    const existing = db.responses.find((item) => item.formId === form.id && item.clientId === clientId && item.status === 'partial');
+    if (existing) {
+      existing.answers = { ...existing.answers, ...answers };
+      existing.updatedAt = now();
+      return { response: existing, status: 200 };
+    }
 
-  const response = {
-    id: id('resp'),
-    formId: form.id,
-    clientId,
-    answers,
-    status: 'partial',
-    createdAt: now(),
-    updatedAt: now()
-  };
-  db.responses.push(response);
-  await writeDb(db);
-  res.status(201).json(response);
+    const response = {
+      id: id('resp'),
+      formId: form.id,
+      clientId,
+      answers,
+      status: 'partial',
+      createdAt: now(),
+      updatedAt: now()
+    };
+    db.responses.push(response);
+    return { response, status: 201 };
+  });
+  if (result?.error) return res.status(result.status).json({ message: result.error });
+  if (result?.empty) return res.status(204).end();
+  if (result.response) return res.status(result.status).json(result.response);
 });
 
 app.post('/api/forms/:id/responses', async (req, res) => {
-  const db = await readDb();
-  const form = findForm(db, req.params.id);
-  if (!form || !form.published) return res.status(404).json({ message: 'Form is not public' });
-  if (isClosed(form)) return res.status(403).json({ message: 'Form is closed' });
+  const result = await updateDb(async (db) => {
+    const form = findForm(db, req.params.id);
+    if (!form || !form.published) return { error: 'Form is not public', status: 404 };
+    if (isClosed(form)) return { error: 'Form is closed', status: 403 };
 
-  const completeCount = db.responses.filter((item) => item.formId === form.id && item.status === 'complete').length;
-  if (form.settings.submissionLimit && completeCount >= form.settings.submissionLimit) {
-    return res.status(403).json({ message: 'Submission limit reached' });
-  }
+    const completeCount = db.responses.filter((item) => item.formId === form.id && item.status === 'complete').length;
+    if (form.settings.submissionLimit && completeCount >= form.settings.submissionLimit) {
+      return { error: 'Submission limit reached', status: 403 };
+    }
 
-  const clientId = String(req.body.clientId || '');
-  if (form.settings.preventDuplicates && clientId && db.responses.some((item) => item.formId === form.id && item.clientId === clientId && item.status === 'complete')) {
-    return res.status(409).json({ message: 'Duplicate submission blocked' });
-  }
+    const clientId = String(req.body.clientId || '');
+    if (form.settings.preventDuplicates && clientId && db.responses.some((item) => item.formId === form.id && item.clientId === clientId && item.status === 'complete')) {
+      return { error: 'Duplicate submission blocked', status: 409 };
+    }
 
-  const { errors, answers } = validateSubmission(form, req.body.answers || {}, {
-    password: req.body.password,
-    recaptcha: req.body.recaptcha
+    const { errors, answers } = validateSubmission(form, req.body.answers || {}, {
+      password: req.body.password,
+      recaptcha: req.body.recaptcha
+    });
+    if (Object.keys(errors).length) return { errors, status: 400 };
+
+    const response = {
+      id: id('resp'),
+      formId: form.id,
+      clientId,
+      answers,
+      status: 'complete',
+      createdAt: now(),
+      updatedAt: now()
+    };
+
+    db.responses = db.responses.filter((item) => !(item.formId === form.id && item.clientId === clientId && item.status === 'partial'));
+    db.responses.push(response);
+    const webhookForm = form.settings.webhookUrl ? JSON.parse(JSON.stringify(form)) : null;
+    return { response, status: 201, webhookForm };
   });
-  if (Object.keys(errors).length) return res.status(400).json({ errors });
-
-  const response = {
-    id: id('resp'),
-    formId: form.id,
-    clientId,
-    answers,
-    status: 'complete',
-    createdAt: now(),
-    updatedAt: now()
-  };
-
-  db.responses = db.responses.filter((item) => !(item.formId === form.id && item.clientId === clientId && item.status === 'partial'));
-  db.responses.push(response);
-  const webhookLog = await sendWebhook(form, response);
-  if (webhookLog) db.webhookEvents.push(webhookLog);
-  await writeDb(db);
-  res.status(201).json(response);
+  if (result.error) return res.status(result.status).json({ message: result.error });
+  if (result.errors) return res.status(result.status).json({ errors: result.errors });
+  res.status(result.status).json(result.response);
+  if (result.webhookForm) void sendWebhookInBackground(result.webhookForm, result.response);
 });
 
-app.get('/api/forms/:id/responses', async (req, res) => {
+app.get('/api/forms/:id/responses', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).json({ message: 'Form not found' });
   res.json(db.responses.filter((item) => item.formId === form.id && item.status === 'complete').sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
 });
 
-app.get('/api/forms/:id/partials', async (req, res) => {
+app.get('/api/forms/:id/partials', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).json({ message: 'Form not found' });
   res.json(db.responses.filter((item) => item.formId === form.id && item.status === 'partial').sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
 });
 
-app.get('/api/forms/:id/responses.csv', async (req, res) => {
+app.get('/api/forms/:id/responses.csv', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).send('Not found');
@@ -614,7 +870,7 @@ app.get('/api/forms/:id/responses.csv', async (req, res) => {
   res.send(`\uFEFF${csv}`);
 });
 
-app.get('/api/forms/:id/partials.csv', async (req, res) => {
+app.get('/api/forms/:id/partials.csv', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).send('Not found');

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   ArrowLeft,
@@ -29,7 +29,7 @@ import {
   Workflow
 } from 'lucide-react';
 import { api } from './api';
-import type { AnswerValue, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme } from './types';
+import type { AnswerValue, AuthState, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme } from './types';
 import {
   absoluteEmbedUrl,
   absolutePublicUrl,
@@ -52,6 +52,7 @@ import './styles.css';
 
 type WorkspaceTab = 'build' | 'logic' | 'design' | 'share' | 'results' | 'settings';
 type Lang = 'en' | 'zh';
+type Translation = (typeof text)['en'];
 
 const text = {
   en: {
@@ -162,7 +163,17 @@ const text = {
     unfavorite: 'Unfavorite',
     starredForm: 'Added to favorites',
     unstarredForm: 'Removed from favorites',
-    deleteFormAction: 'Delete form'
+    deleteFormAction: 'Delete form',
+    adminTitle: 'Admin access',
+    setupAdmin: 'Create admin password',
+    loginAdmin: 'Log in',
+    adminPasswordHint: 'Use at least 10 characters. Keep it somewhere safe.',
+    adminPassword: 'Admin password',
+    confirmPassword: 'Confirm password',
+    passwordsDoNotMatch: 'Passwords do not match',
+    logout: 'Log out',
+    authChecking: 'Checking access',
+    setupBlocked: 'Admin setup is locked on this server. Set ADMIN_PASSWORD or enable setup from SSH.'
   },
   zh: {
     language: '語言',
@@ -267,7 +278,22 @@ const text = {
     uploadFiles: '上傳附件',
     addMoreFiles: '增加附件',
     fileHint: '可上傳圖片、PDF 和文件，最多 10 個檔案。',
-    removeFile: '移除檔案'
+    removeFile: '移除檔案',
+    favorite: '收藏',
+    unfavorite: '取消收藏',
+    starredForm: '已加入收藏',
+    unstarredForm: '已取消收藏',
+    deleteFormAction: '刪除表單',
+    adminTitle: '管理員登入',
+    setupAdmin: '建立管理員密碼',
+    loginAdmin: '登入',
+    adminPasswordHint: '最少 10 個字元，請自己保存好。',
+    adminPassword: '管理員密碼',
+    confirmPassword: '確認密碼',
+    passwordsDoNotMatch: '兩次密碼不一致',
+    logout: '登出',
+    authChecking: '正在檢查權限',
+    setupBlocked: '這個伺服器已鎖定首次設定，請用 SSH 設定 ADMIN_PASSWORD 或開啟 setup。'
   }
 } as const;
 
@@ -299,7 +325,7 @@ const fieldTypeLabelsZh: Record<FieldType, string> = {
 
 const LanguageContext = React.createContext<{
   lang: Lang;
-  t: (typeof text)['en'];
+  t: Translation;
   toggleLanguage: () => void;
 } | null>(null);
 
@@ -313,8 +339,8 @@ function fieldTypeLabel(type: FieldType, lang: Lang) {
   return lang === 'zh' ? fieldTypeLabelsZh[type] : fieldTypeLabels[type];
 }
 
-function langLabel(label: string, t: (typeof text)['en']) {
-  if (t.language !== '語言') return label;
+function langLabel(label: string, lang: Lang) {
+  if (lang !== 'zh') return label;
   const map: Record<string, string> = {
     equals: '等於',
     'does not equal': '不等於',
@@ -330,10 +356,99 @@ function langLabel(label: string, t: (typeof text)['en']) {
 function LanguageButton({ className = '' }: { className?: string }) {
   const { lang, t, toggleLanguage } = useI18n();
   return (
-    <button className={`language-toggle ${className}`} onClick={toggleLanguage} title={t.language}>
+    <button type="button" className={`language-toggle ${className}`} onClick={toggleLanguage} title={t.language}>
       <Languages size={16} />
       {lang === 'en' ? '中文' : 'EN'}
     </button>
+  );
+}
+
+function AdminGate({ onReady }: { onReady: () => void }) {
+  const { t } = useI18n();
+  const [auth, setAuth] = useState<AuthState | null>(null);
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [message, setMessage] = useState('');
+  const needsSetup = auth ? !auth.configured : false;
+  const setupBlocked = needsSetup && auth?.setupAllowed === false;
+
+  useEffect(() => {
+    api
+      .authState()
+      .then((state) => {
+        setAuth(state);
+        if (state.authenticated) onReady();
+      })
+      .catch(() => setMessage(t.saveFailed));
+  }, [onReady, t.saveFailed]);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setMessage('');
+    if (setupBlocked) {
+      setMessage(t.setupBlocked);
+      return;
+    }
+    if (needsSetup && password !== confirmPassword) {
+      setMessage(t.passwordsDoNotMatch);
+      return;
+    }
+    try {
+      if (needsSetup) await api.setupAdmin(password);
+      else await api.login(password);
+      onReady();
+    } catch (error) {
+      setMessage(error && typeof error === 'object' && 'message' in error ? String(error.message) : t.saveFailed);
+    }
+  }
+
+  if (!auth) {
+    return (
+      <main className="auth-page">
+        <div className="auth-panel">
+          <div className="auth-header">
+            <div className="brand-mark">
+              <Lock size={18} />
+            </div>
+            <LanguageButton className="auth-language" />
+          </div>
+          <p>{t.authChecking}</p>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <main className="auth-page">
+      <form className="auth-panel" onSubmit={submit}>
+        <div className="auth-header">
+          <div className="brand-mark">
+            <Lock size={18} />
+          </div>
+          <LanguageButton className="auth-language" />
+        </div>
+        <div>
+          <p className="eyebrow">{t.adminTitle}</p>
+          <h1>{needsSetup ? t.setupAdmin : t.loginAdmin}</h1>
+        </div>
+        <label className="stack-label">
+          {t.adminPassword}
+          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={needsSetup ? 10 : undefined} autoFocus />
+        </label>
+        {needsSetup && (
+          <label className="stack-label">
+            {t.confirmPassword}
+            <input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} minLength={10} />
+          </label>
+        )}
+        {needsSetup && <small>{setupBlocked ? t.setupBlocked : t.adminPasswordHint}</small>}
+        {message && <div className="form-error compact">{message}</div>}
+        <button className="submit-button" type="submit" disabled={setupBlocked}>
+          <Lock size={17} />
+          {needsSetup ? t.setupAdmin : t.loginAdmin}
+        </button>
+      </form>
+    </main>
   );
 }
 
@@ -371,6 +486,8 @@ function useRoute() {
 function App() {
   const { path, navigate } = useRoute();
   const [lang, setLang] = useState<Lang>(() => (localStorage.getItem('mini_tally_lang') === 'zh' ? 'zh' : 'en'));
+  const [adminReady, setAdminReady] = useState(false);
+  const markAdminReady = useCallback(() => setAdminReady(true), []);
   const publicMatch = path.match(/^\/form\/([^/]+)$/);
   const embedMatch = path.match(/^\/embed\/([^/]+)$/);
 
@@ -382,7 +499,7 @@ function App() {
   const value = useMemo(
     () => ({
       lang,
-      t: text[lang],
+      t: text[lang] as Translation,
       toggleLanguage: () => setLang((current) => (current === 'en' ? 'zh' : 'en'))
     }),
     [lang]
@@ -392,14 +509,16 @@ function App() {
     <LanguageContext.Provider value={value}>
       {publicMatch || embedMatch ? (
         <PublicForm formKey={(publicMatch || embedMatch)![1]} navigate={navigate} embedded={Boolean(embedMatch)} />
+      ) : !adminReady ? (
+        <AdminGate onReady={markAdminReady} />
       ) : (
-        <Workspace navigate={navigate} />
+        <Workspace navigate={navigate} onLogout={() => setAdminReady(false)} />
       )}
     </LanguageContext.Provider>
   );
 }
 
-function Workspace({ navigate }: { navigate: (path: string) => void }) {
+function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; onLogout: () => void }) {
   const { lang, t } = useI18n();
   const [forms, setForms] = useState<Form[]>([]);
   const [selectedId, setSelectedId] = useState('');
@@ -407,7 +526,7 @@ function Workspace({ navigate }: { navigate: (path: string) => void }) {
   const [responses, setResponses] = useState<FormResponse[]>([]);
   const [partials, setPartials] = useState<FormResponse[]>([]);
   const [tab, setTab] = useState<WorkspaceTab>('build');
-  const [status, setStatus] = useState(t.ready);
+  const [status, setStatus] = useState<string>(t.ready);
   const [saving, setSaving] = useState(false);
 
   const selectedForm = useMemo(() => forms.find((form) => form.id === selectedId), [forms, selectedId]);
@@ -542,6 +661,11 @@ function Workspace({ navigate }: { navigate: (path: string) => void }) {
     setStatus(t.linkCopied);
   }
 
+  async function logout() {
+    await api.logout().catch(() => undefined);
+    onLogout();
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -556,6 +680,11 @@ function Workspace({ navigate }: { navigate: (path: string) => void }) {
         </div>
 
         <LanguageButton />
+
+        <button className="text-button" onClick={() => void logout()}>
+          <Lock size={16} />
+          {t.logout}
+        </button>
 
         <button className="primary-action" onClick={createNewForm}>
           <Plus size={17} />
@@ -687,7 +816,7 @@ function FormEditor({
 }: {
   draft: Form;
   updateDraft: (updater: (current: Form) => Form) => void;
-  saveDraft: () => void;
+  saveDraft: (nextDraft?: Form | null) => void;
   deleteCurrentForm: () => void;
 }) {
   const { lang, t } = useI18n();
@@ -764,7 +893,10 @@ function FormEditor({
               />
               <select
                 value={field.type}
-                onChange={(event) => updateField(field.id, migrateField({ ...field, type: event.target.value }).type === field.type ? {} : migrateField({ ...field, type: event.target.value }))}
+                onChange={(event) => {
+                  const nextField = migrateField({ ...field, type: event.target.value as FieldType });
+                  updateField(field.id, nextField.type === field.type ? {} : nextField);
+                }}
                 onBlur={() => saveDraft()}
                 aria-label="Field type"
               >
@@ -897,7 +1029,7 @@ function FormEditor({
                 </span>
                 <div>
                   <strong>{t.uploadFiles}</strong>
-                  <small>{t.language === '瑾炶█' ? '\u9019\u88e1\u662f\u7de8\u8f2f\u6642\u7684\u5340\u584a\u9810\u89bd\uff0c\u53f3\u5074\u9810\u89bd\u5361\u53ef\u4ee5\u5be6\u969b\u6e2c\u8a66\u4e0a\u50b3\u3002' : 'This is the editor block preview. Use the preview card on the right to test uploads.'}</small>
+                  <small>{lang === 'zh' ? '這裡是編輯時的區塊預覽，右側預覽卡可以實際測試上傳。' : 'This is the editor block preview. Use the preview card on the right to test uploads.'}</small>
                 </div>
               </div>
             )}
@@ -917,7 +1049,7 @@ function OptionEditor({
   values: string[];
   onCommit: (values: string[]) => void;
 }) {
-  const { t } = useI18n();
+  const { lang, t } = useI18n();
   const [draftValues, setDraftValues] = useState(values.length ? values : ['']);
 
   useEffect(() => {
@@ -991,7 +1123,7 @@ function NumberInput({
   label: string;
   value: number;
   onChange: (value: number) => void;
-  saveDraft: () => void;
+  saveDraft: (nextDraft?: Form | null) => void;
 }) {
   return (
     <label className="stack-label">
@@ -1045,9 +1177,9 @@ function LogicPanel({
 }: {
   form: Form;
   updateDraft: (updater: (current: Form) => Form) => void;
-  saveDraft: () => void;
+  saveDraft: (nextDraft?: Form | null) => void;
 }) {
-  const { t } = useI18n();
+  const { lang, t } = useI18n();
   function updateField(fieldId: string, patch: Partial<FormField>) {
     updateDraft((current) => ({
       ...current,
@@ -1090,7 +1222,7 @@ function LogicPanel({
                   >
                     {Object.entries(logicOperators).map(([key, label]) => (
                     <option key={key} value={key}>
-                        {langLabel(label, t)}
+                    {langLabel(label, lang)}
                       </option>
                     ))}
                   </select>
@@ -1117,7 +1249,7 @@ function DesignPanel({
 }: {
   form: Form;
   updateDraft: (updater: (current: Form) => Form) => void;
-  saveDraft: () => void;
+  saveDraft: (nextDraft?: Form | null) => void;
 }) {
   const { t } = useI18n();
   function updateTheme(patch: Partial<FormTheme>) {
@@ -1294,7 +1426,7 @@ function SettingsPanel({
 }: {
   form: Form;
   updateDraft: (updater: (current: Form) => Form) => void;
-  saveDraft: () => void;
+  saveDraft: (nextDraft?: Form | null) => void;
 }) {
   const { t } = useI18n();
   function updateSettings(patch: Partial<FormSettings>) {
@@ -1395,7 +1527,7 @@ function PublicForm({ formKey, navigate, embedded = false }: { formKey: string; 
 
   useEffect(() => {
     api
-      .getForm(formKey)
+      .getPublicForm(formKey)
       .then((nextForm) => {
         if (!nextForm.published) {
           setState('missing');
@@ -1631,7 +1763,7 @@ function FieldInput({
   }
 
   if (field.type === 'multi_select') {
-    const selected = Array.isArray(value) ? value : [];
+    const selected = Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
     return (
       <select multiple value={selected} onChange={(event) => onChange(Array.from(event.currentTarget.selectedOptions).map((option) => option.value))} disabled={disabled}>
         {field.options.map((option) => (
@@ -1657,7 +1789,7 @@ function FieldInput({
   }
 
   if (field.type === 'checkboxes' || field.type === 'ranking') {
-    const selected = Array.isArray(value) ? value : [];
+    const selected = Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
     return (
       <div className="choice-group">
         {field.options.map((option) => (

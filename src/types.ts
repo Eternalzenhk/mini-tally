@@ -113,3 +113,9 @@ export type FormResponse = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type AuthState = {
+  configured: boolean;
+  authenticated: boolean;
+  setupAllowed?: boolean;
+};
