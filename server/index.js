@@ -1,17 +1,23 @@
 import crypto from 'node:crypto';
 import express from 'express';
 import fs from 'node:fs/promises';
+import net from 'node:net';
 import path from 'node:path';
+import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import {
+  createBackup,
   ensureStore,
   getAttachment,
   getFormVersion,
   getUploadAbsolutePath,
   insertAuditEvent,
+  insertEmailEvent,
   insertFormVersion,
   listAuditEvents,
+  listEmailEvents,
   listFormVersions,
+  listMaintenanceEvents,
   materializeAnswers,
   readAdminConfig,
   readDb,
@@ -31,6 +37,12 @@ const listenHost = process.env.LISTEN_HOST || '0.0.0.0';
 const adminCookieName = 'mini_tally_admin';
 const fallbackAdminSessionSecret = process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const adminSessionTtlMs = 7 * 24 * 60 * 60 * 1000;
+const minimumWebhookRetryIntervalMs = process.env.NODE_ENV === 'production' ? 30_000 : 1_000;
+const webhookRetryIntervalMs = Math.max(minimumWebhookRetryIntervalMs, envNumber('WEBHOOK_RETRY_INTERVAL_MS', 5 * 60 * 1000));
+const webhookRetryMaxAttempts = Math.max(1, Math.min(20, envNumber('WEBHOOK_RETRY_MAX_ATTEMPTS', 5)));
+const webhookRetryMinAgeMs = Math.max(0, envNumber('WEBHOOK_RETRY_MIN_AGE_MS', 60_000));
+const scheduledBackupIntervalHours = Math.max(1, envNumber('BACKUP_INTERVAL_HOURS', 24));
+const scheduledBackupRetain = Math.max(1, Math.min(30, envNumber('BACKUP_RETAIN', 7)));
 
 const fieldTypes = [
   'short_text',
@@ -139,6 +151,12 @@ process.on('unhandledRejection', (error) => {
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, service: 'mini-tally' });
 });
+
+function envNumber(name, fallback) {
+  if (!(name in process.env)) return fallback;
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
 
 function now() {
   return new Date().toISOString();
@@ -739,11 +757,291 @@ async function sendWebhookInBackground(form, response) {
   }
 }
 
+async function retryOneWebhook(event, reason = 'auto') {
+  const db = await readDb();
+  const form = db.forms.find((item) => item.id === event.formId);
+  if (!form?.settings?.webhookUrl) return null;
+  const response = db.responses.find((item) => item.id === event.responseId && item.formId === form.id);
+  if (!response) return null;
+
+  const result = await sendWebhook(form, response, event);
+  await updateDb((nextDb) => {
+    const eventIndex = nextDb.webhookEvents.findIndex((item) => item.id === result.id && item.formId === result.formId);
+    if (eventIndex === -1) nextDb.webhookEvents.push(result);
+    else nextDb.webhookEvents[eventIndex] = result;
+    return null;
+  });
+  await audit(reason === 'manual' ? 'webhook.retried' : 'webhook.auto_retried', {
+    formId: result.formId,
+    targetId: result.id,
+    message: `${reason === 'manual' ? 'Retried' : 'Auto retried'} webhook ${result.id}`,
+    metadata: { ok: result.ok, status: result.status, attempts: result.attempts }
+  });
+  return result;
+}
+
+async function retryFailedWebhooks() {
+  const db = await readDb();
+  const cutoff = Date.now() - webhookRetryMinAgeMs;
+  const candidates = db.webhookEvents
+    .filter((event) => !event.ok && Number(event.attempts || 1) < webhookRetryMaxAttempts)
+    .filter((event) => new Date(event.lastAttemptAt || event.createdAt).getTime() <= cutoff)
+    .sort((a, b) => (a.lastAttemptAt || a.createdAt).localeCompare(b.lastAttemptAt || b.createdAt))
+    .slice(0, 10);
+  for (const event of candidates) {
+    try {
+      await retryOneWebhook(event, 'auto');
+    } catch (error) {
+      console.error('Automatic webhook retry failed:', error);
+    }
+  }
+}
+
+function startWebhookRetryScheduler() {
+  if (process.env.ENABLE_WEBHOOK_RETRY === 'false') return;
+  const run = () => retryFailedWebhooks().catch((error) => console.error('Webhook retry scheduler failed:', error));
+  const handle = setInterval(run, webhookRetryIntervalMs);
+  handle.unref();
+  setTimeout(run, Math.min(15_000, webhookRetryIntervalMs)).unref();
+}
+
+function startBackupScheduler() {
+  if (process.env.ENABLE_SCHEDULED_BACKUPS !== 'true') return;
+  const intervalMs = scheduledBackupIntervalHours * 60 * 60 * 1000;
+  const run = async () => {
+    const event = await createBackup({ reason: 'scheduled', retain: scheduledBackupRetain });
+    await audit('backup.scheduled', {
+      targetId: event.id,
+      message: event.message,
+      metadata: { ok: event.ok, path: event.relativePath, size: event.size }
+    });
+  };
+  const handle = setInterval(() => {
+    run().catch((error) => console.error('Scheduled backup failed:', error));
+  }, intervalMs);
+  handle.unref();
+  setTimeout(() => {
+    run().catch((error) => console.error('Scheduled backup failed:', error));
+  }, Math.min(60_000, intervalMs)).unref();
+}
+
 function formWebhookEvents(db, formId) {
   return db.webhookEvents
     .filter((event) => event.formId === formId)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .slice(0, 100);
+}
+
+function configuredSmtp() {
+  const host = String(process.env.SMTP_HOST || '').trim();
+  if (!host) return null;
+  const secure = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true';
+  return {
+    host,
+    port: Number(process.env.SMTP_PORT) || (secure ? 465 : 587),
+    secure,
+    user: String(process.env.SMTP_USER || ''),
+    pass: String(process.env.SMTP_PASS || ''),
+    from: String(process.env.SMTP_FROM || process.env.SMTP_USER || 'mini-tally@localhost')
+  };
+}
+
+function notificationRecipients(value) {
+  return String(value || '')
+    .split(/[,\n;]/)
+    .map((item) => item.trim())
+    .filter((item) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item))
+    .slice(0, 20);
+}
+
+function emailSubject(form) {
+  return `New Mini Tally response: ${form.title || 'Untitled form'}`;
+}
+
+function emailText(form, response) {
+  const lines = [
+    `New response for ${form.title || 'Untitled form'}`,
+    `Response ID: ${response.id}`,
+    `Submitted: ${response.createdAt}`,
+    ''
+  ];
+  for (const field of form.fields || []) {
+    lines.push(`${field.label || field.key}: ${displayAnswer(stripPrivateAttachmentData(response.answers[field.id] ?? null))}`);
+  }
+  return lines.join('\n');
+}
+
+function emailData({ from, to, subject, text }) {
+  const headers = [
+    `From: ${formatEmailHeader(from)}`,
+    `To: ${to.map(formatEmailHeader).join(', ')}`,
+    `Subject: ${encodeHeader(subject)}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit'
+  ];
+  return `${headers.join('\r\n')}\r\n\r\n${String(text || '').replace(/\r?\n/g, '\r\n')}\r\n`;
+}
+
+function formatEmailHeader(value) {
+  return String(value || '').replace(/[\r\n]/g, '').trim();
+}
+
+function encodeHeader(value) {
+  const text = String(value || '').replace(/[\r\n]/g, '').trim();
+  return /^[\x00-\x7F]*$/.test(text) ? text : `=?UTF-8?B?${Buffer.from(text, 'utf8').toString('base64')}?=`;
+}
+
+async function smtpSendMail(config, { to, subject, text }) {
+  const socket = await openSmtpSocket(config);
+  let activeSocket = socket;
+  try {
+    await expectSmtp(socket, [220]);
+    await smtpCommand(socket, `EHLO ${smtpHostName()}`, [250]);
+    if (!config.secure && String(process.env.SMTP_STARTTLS || 'true').toLowerCase() !== 'false') {
+      await smtpCommand(socket, 'STARTTLS', [220]);
+      const secureSocket = tls.connect({ socket, servername: config.host });
+      await new Promise((resolve, reject) => {
+        secureSocket.once('secureConnect', resolve);
+        secureSocket.once('error', reject);
+      });
+      activeSocket = secureSocket;
+      await smtpConversation(secureSocket, config, { to, subject, text });
+      return;
+    }
+    await smtpConversation(socket, config, { to, subject, text });
+  } finally {
+    activeSocket.destroy();
+  }
+}
+
+async function smtpConversation(socket, config, { to, subject, text }) {
+  if (socket.encrypted) await smtpCommand(socket, `EHLO ${smtpHostName()}`, [250]);
+  if (config.user || config.pass) {
+    await smtpCommand(socket, 'AUTH LOGIN', [334]);
+    await smtpCommand(socket, Buffer.from(config.user).toString('base64'), [334]);
+    await smtpCommand(socket, Buffer.from(config.pass).toString('base64'), [235]);
+  }
+  await smtpCommand(socket, `MAIL FROM:<${smtpAddress(config.from)}>`, [250]);
+  for (const recipient of to) {
+    await smtpCommand(socket, `RCPT TO:<${smtpAddress(recipient)}>`, [250, 251]);
+  }
+  await smtpCommand(socket, 'DATA', [354]);
+  await smtpCommand(socket, `${emailData({ from: config.from, to, subject, text }).replace(/\r?\n\./g, '\r\n..')}\r\n.`, [250]);
+  await smtpCommand(socket, 'QUIT', [221]).catch(() => undefined);
+}
+
+function openSmtpSocket(config) {
+  return new Promise((resolve, reject) => {
+    const socket = config.secure
+      ? tls.connect({ host: config.host, port: config.port, servername: config.host })
+      : net.connect({ host: config.host, port: config.port });
+    socket.setTimeout(30_000, () => {
+      socket.destroy(new Error('SMTP connection timed out'));
+    });
+    socket.once('error', reject);
+    socket.once(config.secure ? 'secureConnect' : 'connect', () => resolve(socket));
+  });
+}
+
+function smtpCommand(socket, command, expected) {
+  socket.write(`${command}\r\n`);
+  return expectSmtp(socket, expected);
+}
+
+function expectSmtp(socket, expected) {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    const cleanup = () => {
+      socket.off('data', onData);
+      socket.off('error', onError);
+      socket.off('timeout', onTimeout);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onTimeout = () => {
+      cleanup();
+      reject(new Error('SMTP command timed out'));
+    };
+    const onData = (chunk) => {
+      buffer += chunk.toString('utf8');
+      const lines = buffer.split(/\r?\n/).filter(Boolean);
+      if (!lines.length) return;
+      const last = lines[lines.length - 1];
+      if (!/^\d{3} /.test(last)) return;
+      cleanup();
+      const code = Number(last.slice(0, 3));
+      if (expected.includes(code)) resolve({ code, message: buffer.trim() });
+      else reject(new Error(`SMTP error ${code}: ${buffer.trim()}`));
+    };
+    socket.on('data', onData);
+    socket.once('error', onError);
+    socket.once('timeout', onTimeout);
+  });
+}
+
+function smtpAddress(value) {
+  const match = String(value || '').match(/<([^>]+)>/);
+  return (match ? match[1] : value).replace(/[\r\n<>]/g, '').trim();
+}
+
+function smtpHostName() {
+  return String(process.env.SMTP_HELO || 'mini-tally.local').replace(/[^a-zA-Z0-9.-]/g, '') || 'mini-tally.local';
+}
+
+async function sendEmailNotification(form, response) {
+  const to = notificationRecipients(form.settings.emailNotifications);
+  if (!to.length) return null;
+  const config = configuredSmtp();
+  const event = {
+    id: id('mail'),
+    formId: form.id,
+    responseId: response.id,
+    to,
+    ok: false,
+    message: '',
+    createdAt: now()
+  };
+
+  if (!config) {
+    event.message = 'SMTP is not configured';
+    await insertEmailEvent(event);
+    return event;
+  }
+
+  try {
+    await smtpSendMail(config, {
+      to,
+      subject: emailSubject(form),
+      text: emailText(form, response)
+    });
+    event.ok = true;
+    event.message = 'Email sent';
+  } catch (error) {
+    event.message = error.message || 'Email failed';
+  }
+
+  await insertEmailEvent(event);
+  return event;
+}
+
+async function sendEmailNotificationInBackground(form, response) {
+  if (!form.settings.emailNotifications) return;
+  try {
+    const event = await sendEmailNotification(form, response);
+    if (event) {
+      await audit('email.sent', {
+        formId: event.formId,
+        targetId: event.responseId,
+        message: event.message,
+        metadata: { ok: event.ok, to: event.to }
+      });
+    }
+  } catch (error) {
+    console.error('Email notification failed:', error);
+  }
 }
 
 async function audit(action, { formId = '', targetId = '', message = '', metadata = {} } = {}) {
@@ -987,7 +1285,8 @@ app.post('/api/forms/:id/responses', submissionLimiter, async (req, res) => {
     response.answers = await materializeAnswers(form, response, response.answers);
     db.responses.push(response);
     const webhookForm = form.settings.webhookUrl ? JSON.parse(JSON.stringify(form)) : null;
-    return { response, status: 201, webhookForm };
+    const emailForm = form.settings.emailNotifications ? JSON.parse(JSON.stringify(form)) : null;
+    return { response, status: 201, webhookForm, emailForm };
   });
   if (result.error) return res.status(result.status).json({ message: result.error });
   if (result.errors) return res.status(result.status).json({ errors: result.errors });
@@ -999,6 +1298,7 @@ app.post('/api/forms/:id/responses', submissionLimiter, async (req, res) => {
     metadata: { clientId: result.response.clientId }
   }).catch((error) => console.error('Audit log failed:', error));
   if (result.webhookForm) void sendWebhookInBackground(result.webhookForm, result.response);
+  if (result.emailForm) void sendEmailNotificationInBackground(result.emailForm, result.response);
 });
 
 app.get('/api/forms/:id/responses', requireAdmin, async (req, res) => {
@@ -1030,6 +1330,14 @@ app.get('/api/forms/:id/webhooks', requireAdmin, async (req, res) => {
   res.json(formWebhookEvents(db, form.id));
 });
 
+app.get('/api/forms/:id/emails', requireAdmin, async (req, res) => {
+  const db = await readDb();
+  const form = findForm(db, req.params.id);
+  if (!form) return res.status(404).json({ message: 'Form not found' });
+  const events = await listEmailEvents({ formId: form.id, limit: req.query.limit || 100 });
+  res.json(events);
+});
+
 app.post('/api/forms/:id/webhooks/:eventId/retry', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
@@ -1040,26 +1348,29 @@ app.post('/api/forms/:id/webhooks/:eventId/retry', requireAdmin, async (req, res
   if (!response) return res.status(404).json({ message: 'Response not found' });
   if (!form.settings.webhookUrl) return res.status(400).json({ message: 'Webhook URL is not configured' });
 
-  const result = await sendWebhook(form, response, event);
-  await updateDb((nextDb) => {
-    const eventIndex = nextDb.webhookEvents.findIndex((item) => item.id === event.id && item.formId === form.id);
-    if (eventIndex === -1) nextDb.webhookEvents.push(result);
-    else nextDb.webhookEvents[eventIndex] = result;
-    return null;
-  });
+  const result = await retryOneWebhook(event, 'manual');
   if (result.error) return res.status(result.status).json({ message: result.error });
-  await audit('webhook.retried', {
-    formId: result.formId,
-    targetId: result.id,
-    message: `Retried webhook ${result.id}`,
-    metadata: { ok: result.ok, status: result.status, attempts: result.attempts }
-  });
   res.json(result);
 });
 
 app.get('/api/audit-events', requireAdmin, async (req, res) => {
   const events = await listAuditEvents({ formId: String(req.query.formId || ''), limit: req.query.limit });
   res.json(events);
+});
+
+app.get('/api/maintenance/backups', requireAdmin, async (req, res) => {
+  const events = await listMaintenanceEvents({ kind: 'backup', limit: req.query.limit || 50 });
+  res.json(events);
+});
+
+app.post('/api/maintenance/backups/run', requireAdmin, async (_req, res) => {
+  const event = await createBackup({ reason: 'manual', retain: scheduledBackupRetain });
+  await audit('backup.created', {
+    targetId: event.id,
+    message: event.message,
+    metadata: { ok: event.ok, path: event.relativePath, size: event.size }
+  });
+  res.status(event.ok ? 201 : 500).json(event);
 });
 
 app.get('/api/forms/:id/responses.csv', requireAdmin, async (req, res) => {
@@ -1129,6 +1440,8 @@ app.use((error, req, res, next) => {
 
 async function start() {
   await ensureStore();
+  startWebhookRetryScheduler();
+  startBackupScheduler();
   await configureStaticRoutes();
   console.log(`Starting Mini Tally with Node ${process.version}, port ${port}, host ${listenHost}`);
 

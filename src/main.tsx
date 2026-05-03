@@ -30,7 +30,7 @@ import {
   Workflow
 } from 'lucide-react';
 import { api } from './api';
-import type { AnswerValue, AuditEvent, AuthState, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme, FormVersion, ResponsePage, WebhookEvent } from './types';
+import type { AnswerValue, AuditEvent, AuthState, EmailEvent, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme, FormVersion, MaintenanceEvent, ResponsePage, WebhookEvent } from './types';
 import {
   absoluteEmbedUrl,
   absolutePublicUrl,
@@ -136,6 +136,14 @@ const text = {
     webhookDeliveries: 'Webhook deliveries',
     noWebhooks: 'No webhook deliveries yet.',
     webhookStatus: 'Status',
+    emailDeliveries: 'Email deliveries',
+    noEmailEvents: 'No email deliveries yet.',
+    backupTitle: 'Backups',
+    runBackup: 'Run backup',
+    noBackups: 'No backups yet.',
+    backupCreated: 'Backup created',
+    backupFailed: 'Backup failed',
+    backupSize: 'Size',
     settingsTitle: 'Settings',
     settingsText: 'Control access, submission limits, notifications, webhooks, and data retention.',
     customSlug: 'Custom slug',
@@ -275,6 +283,14 @@ const text = {
     webhookDeliveries: 'Webhook 傳送紀錄',
     noWebhooks: '還沒有 webhook 傳送紀錄。',
     webhookStatus: '狀態',
+    emailDeliveries: 'Email 傳送紀錄',
+    noEmailEvents: '還沒有 Email 傳送紀錄。',
+    backupTitle: '備份',
+    runBackup: '立即備份',
+    noBackups: '還沒有備份。',
+    backupCreated: '已建立備份',
+    backupFailed: '備份失敗',
+    backupSize: '大小',
     settingsTitle: '設定',
     settingsText: '控制存取、提交限制、通知、webhook 與資料保留。',
     customSlug: '自訂網址代稱',
@@ -1442,18 +1458,23 @@ function ResultsPanel({
   const { t } = useI18n();
   const [filters, setFilters] = useState({ search: '', from: '', to: '' });
   const [webhooks, setWebhooks] = useState<WebhookEvent[]>([]);
+  const [emails, setEmails] = useState<EmailEvent[]>([]);
   const responseTotal = responsePage?.total ?? responses.length;
   const partialTotal = partialPage?.total ?? partials.length;
   const completionRate = responseTotal + partialTotal === 0 ? 0 : Math.round((responseTotal / (responseTotal + partialTotal)) * 100);
 
   useEffect(() => {
     let cancelled = false;
-    api.listWebhooks(form.id)
-      .then((events) => {
-        if (!cancelled) setWebhooks(events);
+    Promise.all([api.listWebhooks(form.id), api.listEmailEvents(form.id)])
+      .then(([nextWebhooks, nextEmails]) => {
+        if (cancelled) return;
+        setWebhooks(nextWebhooks);
+        setEmails(nextEmails);
       })
       .catch(() => {
-        if (!cancelled) setWebhooks([]);
+        if (cancelled) return;
+        setWebhooks([]);
+        setEmails([]);
       });
     return () => {
       cancelled = true;
@@ -1530,6 +1551,7 @@ function ResultsPanel({
           await reloadResponses();
         }}
       />
+      <EmailLog events={emails} />
     </section>
   );
 }
@@ -1649,6 +1671,34 @@ function WebhookLog({ events, retry }: { events: WebhookEvent[]; retry: (eventId
   );
 }
 
+function EmailLog({ events }: { events: EmailEvent[] }) {
+  const { t } = useI18n();
+  return (
+    <div className="results-section">
+      <div className="results-section-head">
+        <h3>{t.emailDeliveries}</h3>
+      </div>
+      {events.length === 0 ? (
+        <div className="quiet-empty">{t.noEmailEvents}</div>
+      ) : (
+        <div className="webhook-log-list">
+          {events.map((event) => (
+            <div className="webhook-log-row compact" key={event.id}>
+              <span className={event.ok ? 'status-pill ok' : 'status-pill failed'}>{event.ok ? 'OK' : 'Failed'}</span>
+              <Mail size={16} />
+              <span>
+                {event.message || t.webhookStatus}
+                <small> · {event.to.join(', ')}</small>
+              </span>
+              <time>{formatDate(event.createdAt)}</time>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function renderAnswer(value: AnswerValue, downloadLabel: string): React.ReactNode {
   const files = normalizeFiles(value);
   if (files.length) {
@@ -1671,6 +1721,13 @@ function renderAnswer(value: AnswerValue, downloadLabel: string): React.ReactNod
   return displayAnswer(value);
 }
 
+function formatBytes(value: number) {
+  const size = Number(value) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+  return `${Math.round((size / 1024 / 1024) * 10) / 10} MB`;
+}
+
 function SettingsPanel({
   form,
   updateDraft,
@@ -1685,19 +1742,23 @@ function SettingsPanel({
   const { t } = useI18n();
   const [versions, setVersions] = useState<FormVersion[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [backups, setBackups] = useState<MaintenanceEvent[]>([]);
+  const [backupStatus, setBackupStatus] = useState('');
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([api.listVersions(form.id), api.listAuditEvents({ formId: form.id, limit: 50 })])
-      .then(([nextVersions, nextAuditEvents]) => {
+    Promise.all([api.listVersions(form.id), api.listAuditEvents({ formId: form.id, limit: 50 }), api.listBackups()])
+      .then(([nextVersions, nextAuditEvents, nextBackups]) => {
         if (cancelled) return;
         setVersions(nextVersions);
         setAuditEvents(nextAuditEvents);
+        setBackups(nextBackups);
       })
       .catch(() => {
         if (cancelled) return;
         setVersions([]);
         setAuditEvents([]);
+        setBackups([]);
       });
     return () => {
       cancelled = true;
@@ -1714,6 +1775,18 @@ function SettingsPanel({
     const [nextVersions, nextAuditEvents] = await Promise.all([api.listVersions(restored.id), api.listAuditEvents({ formId: restored.id, limit: 50 })]);
     setVersions(nextVersions);
     setAuditEvents(nextAuditEvents);
+  }
+
+  async function runBackup() {
+    setBackupStatus('');
+    try {
+      const event = await api.runBackup();
+      setBackups(await api.listBackups());
+      setBackupStatus(event.ok ? t.backupCreated : t.backupFailed);
+    } catch {
+      setBackupStatus(t.backupFailed);
+      setBackups(await api.listBackups().catch(() => backups));
+    }
   }
 
   return (
@@ -1768,7 +1841,57 @@ function SettingsPanel({
         {t.redirectUrl}
         <input value={form.settings.redirectUrl} onChange={(event) => updateSettings({ redirectUrl: event.target.value })} onBlur={() => saveDraft()} />
       </label>
+      <BackupPanel backups={backups} status={backupStatus} runBackup={runBackup} />
       <OperationalHistory versions={versions} auditEvents={auditEvents} restore={restoreVersion} />
+    </section>
+  );
+}
+
+function BackupPanel({
+  backups,
+  status,
+  runBackup
+}: {
+  backups: MaintenanceEvent[];
+  status: string;
+  runBackup: () => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [running, setRunning] = useState(false);
+  async function run() {
+    setRunning(true);
+    try {
+      await runBackup();
+    } finally {
+      setRunning(false);
+    }
+  }
+  return (
+    <section className="ops-panel backup-panel">
+      <div className="results-section-head">
+        <h3>{t.backupTitle}</h3>
+        <button className="text-button compact-action" type="button" disabled={running} onClick={() => void run()}>
+          <Files size={15} />
+          {t.runBackup}
+        </button>
+      </div>
+      {status && <div className="status-note">{status}</div>}
+      {backups.length === 0 ? (
+        <div className="quiet-empty small">{t.noBackups}</div>
+      ) : (
+        <div className="ops-list">
+          {backups.map((backup) => (
+            <div className="ops-row backup" key={backup.id}>
+              <span>
+                <strong>{backup.ok ? t.backupCreated : t.backupFailed}</strong>
+                <small>{backup.message}</small>
+              </span>
+              <small>{formatBytes(backup.size)}</small>
+              <time>{formatDate(backup.createdAt)}</time>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }

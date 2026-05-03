@@ -12,6 +12,7 @@ export const sqlitePath = path.join(dataDir, 'mini-tally.sqlite');
 export const legacyFormsPath = path.join(dataDir, 'forms.json');
 export const legacyAdminPath = path.join(dataDir, 'admin.json');
 export const uploadsDir = path.join(dataDir, 'uploads');
+export const backupsDir = path.join(dataDir, 'backups');
 
 let database;
 let initPromise;
@@ -47,6 +48,7 @@ export async function ensureStore() {
 async function initializeStore() {
   await fs.mkdir(dataDir, { recursive: true });
   await fs.mkdir(uploadsDir, { recursive: true });
+  await fs.mkdir(backupsDir, { recursive: true });
   database = new DatabaseSync(sqlitePath);
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
@@ -150,6 +152,26 @@ async function initializeStore() {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS email_events (
+      id TEXT PRIMARY KEY,
+      form_id TEXT NOT NULL DEFAULT '',
+      response_id TEXT NOT NULL DEFAULT '',
+      to_json TEXT NOT NULL DEFAULT '[]',
+      ok INTEGER NOT NULL DEFAULT 0,
+      message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS maintenance_events (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL DEFAULT '',
+      ok INTEGER NOT NULL DEFAULT 0,
+      relative_path TEXT NOT NULL DEFAULT '',
+      size INTEGER NOT NULL DEFAULT 0,
+      message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS admin_config (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       password_hash TEXT,
@@ -163,6 +185,8 @@ async function initializeStore() {
     CREATE INDEX IF NOT EXISTS idx_attachments_response ON attachments(response_id);
     CREATE INDEX IF NOT EXISTS idx_form_versions_form_created ON form_versions(form_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_audit_events_form_created ON audit_events(form_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_email_events_form_created ON email_events(form_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_maintenance_events_kind_created ON maintenance_events(kind, created_at);
   `);
   ensureColumn('webhook_events', 'attempts', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('webhook_events', 'last_attempt_at', 'TEXT');
@@ -340,6 +364,155 @@ export async function listAuditEvents({ formId = '', limit = 100 } = {}) {
     metadata: parseJson(row.metadataJson, {}),
     createdAt: row.createdAt
   }));
+}
+
+export async function insertEmailEvent(event) {
+  await ensureStore();
+  database
+    .prepare('INSERT INTO email_events (id, form_id, response_id, to_json, ok, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(
+      event.id,
+      event.formId || '',
+      event.responseId || '',
+      stringifyJson(Array.isArray(event.to) ? event.to : []),
+      event.ok ? 1 : 0,
+      event.message || '',
+      event.createdAt || now()
+    );
+}
+
+export async function listEmailEvents({ formId = '', limit = 100 } = {}) {
+  await ensureStore();
+  const cappedLimit = Math.max(1, Math.min(200, Number(limit) || 100));
+  const rows = formId
+    ? database
+        .prepare('SELECT id, form_id AS formId, response_id AS responseId, to_json AS toJson, ok, message, created_at AS createdAt FROM email_events WHERE form_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(formId, cappedLimit)
+    : database
+        .prepare('SELECT id, form_id AS formId, response_id AS responseId, to_json AS toJson, ok, message, created_at AS createdAt FROM email_events ORDER BY created_at DESC LIMIT ?')
+        .all(cappedLimit);
+  return rows.map((row) => ({
+    id: row.id,
+    formId: row.formId || '',
+    responseId: row.responseId || '',
+    to: parseJson(row.toJson, []),
+    ok: Boolean(row.ok),
+    message: row.message || '',
+    createdAt: row.createdAt
+  }));
+}
+
+export async function insertMaintenanceEvent(event) {
+  await ensureStore();
+  database
+    .prepare('INSERT INTO maintenance_events (id, kind, ok, relative_path, size, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(
+      event.id,
+      event.kind || 'backup',
+      event.ok ? 1 : 0,
+      event.relativePath || '',
+      Number(event.size) || 0,
+      event.message || '',
+      event.createdAt || now()
+    );
+}
+
+export async function listMaintenanceEvents({ kind = '', limit = 50 } = {}) {
+  await ensureStore();
+  const cappedLimit = Math.max(1, Math.min(100, Number(limit) || 50));
+  const rows = kind
+    ? database
+        .prepare('SELECT id, kind, ok, relative_path AS relativePath, size, message, created_at AS createdAt FROM maintenance_events WHERE kind = ? ORDER BY created_at DESC LIMIT ?')
+        .all(kind, cappedLimit)
+    : database
+        .prepare('SELECT id, kind, ok, relative_path AS relativePath, size, message, created_at AS createdAt FROM maintenance_events ORDER BY created_at DESC LIMIT ?')
+        .all(cappedLimit);
+  return rows.map((row) => ({
+    id: row.id,
+    kind: row.kind || '',
+    ok: Boolean(row.ok),
+    relativePath: row.relativePath || '',
+    size: Number(row.size) || 0,
+    message: row.message || '',
+    createdAt: row.createdAt
+  }));
+}
+
+export async function createBackup({ reason = 'manual', retain = 7 } = {}) {
+  await ensureStore();
+  const createdAt = now();
+  const backupName = `backup-${timestampForFile()}`;
+  const targetDir = path.join(backupsDir, backupName);
+  const relativePath = path.posix.join('backups', backupName);
+  let event;
+
+  try {
+    await fs.mkdir(targetDir, { recursive: false });
+    database.exec('PRAGMA wal_checkpoint(FULL)');
+
+    const files = [sqlitePath, `${sqlitePath}-wal`, `${sqlitePath}-shm`, legacyAdminPath, legacyFormsPath];
+    for (const source of files) {
+      if (!fsSync.existsSync(source)) continue;
+      await fs.copyFile(source, path.join(targetDir, path.basename(source)));
+    }
+
+    if (fsSync.existsSync(uploadsDir)) {
+      await fs.cp(uploadsDir, path.join(targetDir, 'uploads'), { recursive: true, force: true });
+    }
+
+    const size = await directorySize(targetDir);
+    event = {
+      id: id('mnt'),
+      kind: 'backup',
+      ok: true,
+      relativePath,
+      size,
+      message: `${reason} backup completed`,
+      createdAt
+    };
+    await insertMaintenanceEvent(event);
+    await pruneBackups(retain);
+  } catch (error) {
+    event = {
+      id: id('mnt'),
+      kind: 'backup',
+      ok: false,
+      relativePath,
+      size: 0,
+      message: error.message || 'Backup failed',
+      createdAt
+    };
+    await insertMaintenanceEvent(event);
+  }
+
+  return event;
+}
+
+async function pruneBackups(retain) {
+  const keep = Math.max(1, Math.min(30, Number(retain) || 7));
+  const entries = await fs.readdir(backupsDir, { withFileTypes: true }).catch(() => []);
+  const backups = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('backup-'))
+    .map((entry) => entry.name)
+    .sort()
+    .reverse();
+  for (const name of backups.slice(keep)) {
+    await fs.rm(path.join(backupsDir, name), { recursive: true, force: true });
+  }
+}
+
+async function directorySize(target) {
+  let total = 0;
+  const entries = await fs.readdir(target, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const fullPath = path.join(target, entry.name);
+    if (entry.isDirectory()) total += await directorySize(fullPath);
+    else if (entry.isFile()) {
+      const stat = await fs.stat(fullPath);
+      total += stat.size;
+    }
+  }
+  return total;
 }
 
 function readDbFromSqlite() {

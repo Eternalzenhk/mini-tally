@@ -144,6 +144,26 @@ export type WebhookEvent = {
   createdAt: string;
 };
 
+export type EmailEvent = {
+  id: string;
+  formId: string;
+  responseId: string;
+  to: string[];
+  ok: boolean;
+  message: string;
+  createdAt: string;
+};
+
+export type MaintenanceEvent = {
+  id: string;
+  kind: string;
+  ok: boolean;
+  relativePath: string;
+  size: number;
+  message: string;
+  createdAt: string;
+};
+
 export type FormVersion = {
   id: string;
   formId: string;

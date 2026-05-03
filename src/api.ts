@@ -1,4 +1,4 @@
-import type { AuditEvent, AuthState, Form, FormResponse, FormVersion, ResponsePage, WebhookEvent } from './types';
+import type { AuditEvent, AuthState, EmailEvent, Form, FormResponse, FormVersion, MaintenanceEvent, ResponsePage, WebhookEvent } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -84,11 +84,17 @@ export const api = {
     request<WebhookEvent>(`/api/forms/${id}/webhooks/${eventId}/retry`, {
       method: 'POST'
     }),
+  listEmailEvents: (id: string) => request<EmailEvent[]>(`/api/forms/${id}/emails`),
   listAuditEvents: (params: { formId?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
       if (value !== undefined && value !== '') searchParams.set(key, String(value));
     });
     return request<AuditEvent[]>(`/api/audit-events?${searchParams.toString()}`);
-  }
+  },
+  listBackups: () => request<MaintenanceEvent[]>('/api/maintenance/backups'),
+  runBackup: () =>
+    request<MaintenanceEvent>('/api/maintenance/backups/run', {
+      method: 'POST'
+    })
 };

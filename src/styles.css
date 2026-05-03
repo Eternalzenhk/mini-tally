@@ -1164,6 +1164,14 @@ a {
   font-size: 0.9rem;
 }
 
+.webhook-log-row.compact {
+  grid-template-columns: auto 24px minmax(0, 1fr) auto;
+}
+
+.webhook-log-row span small {
+  color: var(--muted);
+}
+
 .webhook-log-row:last-child {
   border-bottom: 0;
 }
@@ -1217,6 +1225,10 @@ a {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
+.ops-row.backup {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
 .ops-row:last-child {
   border-bottom: 0;
 }
@@ -1242,6 +1254,23 @@ a {
   color: var(--muted);
   font-size: 0.82rem;
   white-space: nowrap;
+}
+
+.backup-panel {
+  margin-top: 22px;
+}
+
+.status-note {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 0.86rem;
 }
 
 .status-pill {
@@ -1528,6 +1557,8 @@ a {
   .field-editor-top,
   .field-editor-top.logic-row,
   .field-options-row,
+  .webhook-log-row,
+  .webhook-log-row.compact,
   .split-grid,
   .split-grid.triple,
   .settings-grid,
@@ -1544,6 +1575,14 @@ a {
 
   .field-actions {
     justify-content: flex-end;
+  }
+
+  .webhook-log-row,
+  .webhook-log-row.compact,
+  .ops-row,
+  .ops-row.backup {
+    grid-template-columns: 1fr;
+    align-items: start;
   }
 
   .status-bar {

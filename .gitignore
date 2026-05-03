@@ -9,6 +9,7 @@ data/forms.json
 data/admin.json
 data/mini-tally.sqlite*
 data/uploads/
+data/backups/
 data/*.bak
 data/*.migrated-*.bak
 

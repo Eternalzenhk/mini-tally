@@ -32,6 +32,38 @@ NODE_ENV="production"
 
 Never commit `data/admin.json`, `data/forms.json`, `data/mini-tally.sqlite*`, or `data/uploads`. They can contain password hashes, submissions, and uploaded file data.
 
+## Notifications And Operations
+
+Email notifications use SMTP and are optional. Add one or more recipient addresses in the form Settings tab. Then configure SMTP in Hostinger or your server environment:
+
+```bash
+SMTP_HOST="smtp.example.com"
+SMTP_PORT="587"
+SMTP_SECURE="false"
+SMTP_USER="user@example.com"
+SMTP_PASS="your-smtp-password"
+SMTP_FROM="Mini Tally <user@example.com>"
+```
+
+If SMTP is not configured, submissions still succeed and the email delivery log records `SMTP is not configured`.
+
+Webhook failures are retried automatically in the background. Useful tuning variables:
+
+```bash
+ENABLE_WEBHOOK_RETRY="true"
+WEBHOOK_RETRY_INTERVAL_MS="300000"
+WEBHOOK_RETRY_MIN_AGE_MS="60000"
+WEBHOOK_RETRY_MAX_ATTEMPTS="5"
+```
+
+The Settings tab includes a manual backup button. Backups are stored in `data/backups/backup-<timestamp>/` and include SQLite, WAL/SHM sidecar files, legacy admin/forms JSON when present, and uploads. Scheduled in-app backups are disabled by default; enable them with:
+
+```bash
+ENABLE_SCHEDULED_BACKUPS="true"
+BACKUP_INTERVAL_HOURS="24"
+BACKUP_RETAIN="7"
+```
+
 ## Hostinger Deployment
 
 This app needs Hostinger Node.js hosting, not static file hosting, because it has an Express API, a SQLite database, and private uploaded files.
@@ -101,7 +133,8 @@ Before deploying the protected workspace to Hostinger, make sure the Hostinger N
 - Response and partial-submission CSV export
 - Theme editor and custom CSS
 - Webhook posting with optional HMAC signature
-- Webhook delivery log and manual retry in the results workspace
+- Webhook delivery log, manual retry, and automatic failed-delivery retry
+- Email notification delivery log with optional SMTP sending
 - Local data retention cleanup
 - SQLite storage with automatic legacy `forms.json` migration
 - File uploads stored under `data/uploads` with protected admin downloads
@@ -110,6 +143,7 @@ Before deploying the protected workspace to Hostinger, make sure the Hostinger N
 - Form duplication
 - Form version history with restore
 - Admin activity log for form and response operations
+- Manual in-app backups with optional scheduled backups
 
 ## Local Limitations
 
@@ -117,23 +151,35 @@ Some Tally SaaS features need external services to be truly complete:
 
 - Real payments need Stripe, PayPal, or another payment provider.
 - Custom domains need DNS and hosting configuration.
-- Email notifications need an SMTP or email API provider.
+- Email notifications need an SMTP provider to send real email.
 - Google Sheets, Slack, Airtable, Notion, and Zapier need OAuth/API credentials.
 - Multi-user teams, workspaces, and billing need authentication and accounts.
 
 ## Data
 
-Form definitions, submissions, partial submissions, answers, webhook logs, form versions, activity logs, and admin config are stored in `data/mini-tally.sqlite`.
+Form definitions, submissions, partial submissions, answers, webhook logs, email logs, backup logs, form versions, activity logs, and admin config are stored in `data/mini-tally.sqlite`.
 
 On first launch, if `data/mini-tally.sqlite` does not exist but `data/forms.json` exists, the server migrates the legacy JSON data into SQLite and creates a timestamped `data/forms.json.migrated-*.bak` backup. Existing public form URLs are preserved.
 
 Uploaded files are stored in `data/uploads/<formId>/<responseId>/...`. The database stores only file metadata and relative paths. Attachment downloads require admin login.
 
-Do not commit `data/mini-tally.sqlite*`, `data/uploads`, `data/admin.json`, or legacy `data/forms.json` because they may contain private response data.
+Do not commit `data/mini-tally.sqlite*`, `data/uploads`, `data/backups`, `data/admin.json`, or legacy `data/forms.json` because they may contain private response data.
 
 ## Backup And Restore
 
 The SSH deploy script creates timestamped backups in `.deploy-backup-*` inside the Hostinger app folder before every release. Each backup contains the previous `data` folder, including `mini-tally.sqlite`, SQLite WAL/SHM sidecar files, uploads, and legacy admin/form JSON files.
+
+The app also creates manual or scheduled backups under `data/backups`. To restore an in-app backup from SSH:
+
+```bash
+cd /home/your-user/apps/mini-tally
+cp -a data/backups/backup-YYYY-MM-DDTHH-MM-SS-000Z/mini-tally.sqlite data/mini-tally.sqlite
+cp -a data/backups/backup-YYYY-MM-DDTHH-MM-SS-000Z/mini-tally.sqlite-wal data/mini-tally.sqlite-wal 2>/dev/null || true
+cp -a data/backups/backup-YYYY-MM-DDTHH-MM-SS-000Z/mini-tally.sqlite-shm data/mini-tally.sqlite-shm 2>/dev/null || true
+rm -rf data/uploads
+cp -a data/backups/backup-YYYY-MM-DDTHH-MM-SS-000Z/uploads data/uploads
+touch tmp/restart.txt
+```
 
 To restore from SSH, stop the app from hPanel or touch restart after restore, then copy a backup data folder back into place:
 
