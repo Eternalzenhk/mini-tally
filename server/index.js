@@ -14,7 +14,7 @@ const app = express();
 const port = Number(process.env.PORT || 4177);
 const listenHost = process.env.LISTEN_HOST || '0.0.0.0';
 const adminCookieName = 'mini_tally_admin';
-const adminSessionSecret = process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const fallbackAdminSessionSecret = process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const adminSessionTtlMs = 7 * 24 * 60 * 60 * 1000;
 
 const fieldTypes = [
@@ -159,16 +159,24 @@ function parseCookies(header = '') {
   );
 }
 
-function signSession(payload) {
+async function getAdminSessionSecret() {
+  if (process.env.ADMIN_SESSION_SECRET || process.env.SESSION_SECRET) return fallbackAdminSessionSecret;
+  const config = await readAdminConfig();
+  return config?.sessionSecret || fallbackAdminSessionSecret;
+}
+
+async function signSession(payload) {
+  const secret = await getAdminSessionSecret();
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const signature = crypto.createHmac('sha256', adminSessionSecret).update(body).digest('base64url');
+  const signature = crypto.createHmac('sha256', secret).update(body).digest('base64url');
   return `${body}.${signature}`;
 }
 
-function verifySession(token) {
+async function verifySession(token) {
   const [body, signature] = String(token || '').split('.');
   if (!body || !signature) return false;
-  const expected = crypto.createHmac('sha256', adminSessionSecret).update(body).digest('base64url');
+  const secret = await getAdminSessionSecret();
+  const expected = crypto.createHmac('sha256', secret).update(body).digest('base64url');
   if (
     expected.length !== signature.length ||
     !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
@@ -249,13 +257,13 @@ async function isAdminPassword(password) {
   return verifyPassword(password, config?.passwordHash);
 }
 
-function hasAdminSession(req) {
+async function hasAdminSession(req) {
   const cookies = parseCookies(req.headers.cookie);
   return verifySession(cookies[adminCookieName]);
 }
 
-function requireAdmin(req, res, next) {
-  if (hasAdminSession(req)) return next();
+async function requireAdmin(req, res, next) {
+  if (await hasAdminSession(req)) return next();
   return res.status(401).json({ message: 'Admin login required' });
 }
 
@@ -673,7 +681,7 @@ app.get('/api/auth/me', async (req, res) => {
   const state = await adminState();
   res.json({
     configured: state.configured,
-    authenticated: hasAdminSession(req),
+    authenticated: await hasAdminSession(req),
     setupAllowed: !state.configured && canRunSetup(req)
   });
 });
@@ -685,8 +693,9 @@ app.post('/api/auth/setup', async (req, res) => {
   const password = String(req.body.password || '');
   if (password.length < 10) return res.status(400).json({ message: 'Use at least 10 characters' });
 
-  await writeAdminConfig({ passwordHash: await hashPassword(password), createdAt: now() });
-  const token = signSession({ role: 'admin', exp: Date.now() + adminSessionTtlMs });
+  const sessionSecret = crypto.randomBytes(32).toString('base64url');
+  await writeAdminConfig({ passwordHash: await hashPassword(password), sessionSecret, createdAt: now() });
+  const token = await signSession({ role: 'admin', exp: Date.now() + adminSessionTtlMs });
   setAdminCookie(res, token, Math.floor(adminSessionTtlMs / 1000));
   res.status(201).json({ ok: true });
 });
@@ -696,7 +705,7 @@ app.post('/api/auth/login', async (req, res) => {
   if (!state.configured) return res.status(409).json({ message: 'Admin password is not configured' });
   if (!(await isAdminPassword(req.body.password))) return res.status(401).json({ message: 'Incorrect password' });
 
-  const token = signSession({ role: 'admin', exp: Date.now() + adminSessionTtlMs });
+  const token = await signSession({ role: 'admin', exp: Date.now() + adminSessionTtlMs });
   setAdminCookie(res, token, Math.floor(adminSessionTtlMs / 1000));
   res.json({ ok: true });
 });
