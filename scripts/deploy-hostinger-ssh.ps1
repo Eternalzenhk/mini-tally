@@ -5,8 +5,8 @@ param(
   [string]$RemotePath = $env:HOSTINGER_PATH,
   [string]$AppUrl = $env:HOSTINGER_APP_URL,
   [string]$KeyPath = $env:HOSTINGER_SSH_KEY,
-  [string]$AdminPassword = $env:HOSTINGER_ADMIN_PASSWORD,
-  [string]$PublicFormKey = $env:HOSTINGER_PUBLIC_FORM_KEY,
+  [string]$AdminPassword = $(if ($env:HOSTINGER_ADMIN_PASSWORD) { $env:HOSTINGER_ADMIN_PASSWORD } else { $env:MINI_TALLY_ADMIN_PASSWORD }),
+  [string]$PublicFormKey = $(if ($env:HOSTINGER_PUBLIC_FORM_KEY) { $env:HOSTINGER_PUBLIC_FORM_KEY } else { $env:MINI_TALLY_PUBLIC_FORM_KEY }),
   [switch]$IncludeLocalData
 )
 
