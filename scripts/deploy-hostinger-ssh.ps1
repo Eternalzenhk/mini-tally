@@ -102,7 +102,14 @@ if [ -d "`$APP/data" ]; then
   cp -a "`$APP/data" "`$BACKUP/data"
 fi
 
+for item in server src dist app.js index.js server.js index.html package.json package-lock.json tsconfig.json vite.config.ts README.md; do
+  if [ -e "`$APP/`$item" ]; then
+    chmod -R u+w "`$APP/`$item" 2>/dev/null || true
+  fi
+done
+
 tar -xzf "`$PACKAGE" -C "`$APP"
+chmod -R u+rwX "`$APP/server" "`$APP/src" "`$APP/dist" "`$APP/tmp" 2>/dev/null || true
 
 if [ -d "`$BACKUP/data" ] && [ "$IncludeLocalData" != "True" ]; then
   rm -rf "`$APP/data"
