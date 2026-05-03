@@ -3,12 +3,22 @@ import express from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  ensureStore,
+  getAttachment,
+  getUploadAbsolutePath,
+  materializeAnswers,
+  readAdminConfig,
+  readDb,
+  stripPrivateAttachmentData,
+  updateDb,
+  validateAttachmentValue,
+  withAttachmentDownloadUrls,
+  writeAdminConfig
+} from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.basename(path.resolve(__dirname, '..')) === 'dist' ? path.resolve(__dirname, '..', '..') : path.resolve(__dirname, '..');
-const dataDir = path.join(rootDir, 'data');
-const dbPath = path.join(dataDir, 'forms.json');
-const adminConfigPath = path.join(dataDir, 'admin.json');
 const distDir = path.basename(rootDir) === 'dist' ? rootDir : path.join(rootDir, 'dist');
 const app = express();
 const port = Number(process.env.PORT || 4177);
@@ -71,7 +81,45 @@ const defaultSettings = {
   dataRetentionDays: 0
 };
 
-app.use(express.json({ limit: '8mb' }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '160mb' }));
+
+const rateLimitBuckets = new Map();
+
+function clientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req.socket.remoteAddress || 'unknown';
+}
+
+function rateLimit({ windowMs, max, keyPrefix }) {
+  return (req, res, next) => {
+    const nowMs = Date.now();
+    const key = `${keyPrefix}:${clientIp(req)}`;
+    const bucket = rateLimitBuckets.get(key);
+
+    if (!bucket || bucket.resetAt <= nowMs) {
+      rateLimitBuckets.set(key, { count: 1, resetAt: nowMs + windowMs });
+      return next();
+    }
+
+    bucket.count += 1;
+    if (bucket.count > max) {
+      res.setHeader('Retry-After', String(Math.ceil((bucket.resetAt - nowMs) / 1000)));
+      return res.status(429).json({ message: 'Too many requests. Please try again later.' });
+    }
+
+    return next();
+  };
+}
+
+setInterval(() => {
+  const nowMs = Date.now();
+  for (const [key, bucket] of rateLimitBuckets.entries()) {
+    if (bucket.resetAt <= nowMs) rateLimitBuckets.delete(key);
+  }
+}, 5 * 60 * 1000).unref();
+
+const authLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 30, keyPrefix: 'auth' });
+const submissionLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, keyPrefix: 'submit' });
 
 process.on('uncaughtException', (error) => {
   console.error('Uncaught exception:', error);
@@ -86,52 +134,6 @@ process.on('unhandledRejection', (error) => {
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, service: 'mini-tally' });
 });
-
-async function ensureDb() {
-  await fs.mkdir(dataDir, { recursive: true });
-  try {
-    await fs.access(dbPath);
-  } catch {
-    await fs.writeFile(dbPath, JSON.stringify({ forms: [], responses: [], webhookEvents: [] }, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  const raw = (await fs.readFile(dbPath, 'utf8')).replace(/^\uFEFF/, '');
-  const db = JSON.parse(raw);
-  return {
-    forms: Array.isArray(db.forms) ? db.forms.map(migrateForm) : [],
-    responses: Array.isArray(db.responses) ? db.responses.map(migrateResponse) : [],
-    webhookEvents: Array.isArray(db.webhookEvents) ? db.webhookEvents : []
-  };
-}
-
-async function writeJsonAtomic(filePath, value) {
-  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(value, null, 2));
-  await fs.rename(tmpPath, filePath);
-}
-
-async function writeDb(db) {
-  await writeJsonAtomic(dbPath, db);
-}
-
-let dbQueue = Promise.resolve();
-
-function updateDb(mutator) {
-  const next = dbQueue.then(async () => {
-    const db = await readDb();
-    const result = await mutator(db);
-    await writeDb(db);
-    return result;
-  });
-  dbQueue = next.then(
-    () => undefined,
-    () => undefined
-  );
-  return next;
-}
 
 function now() {
   return new Date().toISOString();
@@ -204,21 +206,6 @@ function cookieOptions(maxAgeSeconds) {
     .join('; ');
 }
 
-async function readAdminConfig() {
-  await fs.mkdir(dataDir, { recursive: true });
-  try {
-    const raw = (await fs.readFile(adminConfigPath, 'utf8')).replace(/^\uFEFF/, '');
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-async function writeAdminConfig(config) {
-  await fs.mkdir(dataDir, { recursive: true });
-  await writeJsonAtomic(adminConfigPath, config);
-}
-
 async function adminState() {
   const hasEnvPassword = Boolean(process.env.ADMIN_PASSWORD);
   const config = await readAdminConfig();
@@ -270,6 +257,7 @@ async function requireAdmin(req, res, next) {
 function publicForm(form) {
   return {
     ...form,
+    fields: form.fields.map((field) => ({ ...field })),
     settings: {
       ...form.settings,
       password: form.settings.password ? '__protected__' : '',
@@ -573,11 +561,8 @@ function validateSubmission(form, rawAnswers, options = {}) {
     if (field.type === 'email' && !missing && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value))) errors[field.id] = 'Invalid email';
     if (field.type === 'url' && !missing && !/^https?:\/\/.+\..+/.test(String(value))) errors[field.id] = 'Enter a valid URL';
     if (['file_upload', 'signature'].includes(field.type) && value) {
-      const files = Array.isArray(value) ? value : [value];
-      const totalSize = files.reduce((sum, file) => sum + (Number(file?.size) || 0), 0);
-      const totalDataUrlSize = files.reduce((sum, file) => sum + String(file?.dataUrl || '').length, 0);
-      if (files.length > 10) errors[field.id] = 'Upload up to 10 files';
-      if (totalSize > 12 * 1024 * 1024 || totalDataUrlSize > 16_000_000) errors[field.id] = 'Files are too large for local JSON storage';
+      const error = validateAttachmentValue(field, value);
+      if (error) errors[field.id] = error;
     }
   }
 
@@ -598,6 +583,59 @@ function responseRows(form, responses) {
     ...form.fields.map((field) => response.answers[field.id])
   ]);
   return { header, rows };
+}
+
+function adminResponse(response) {
+  return {
+    ...response,
+    answers: mapAnswerValues(response.answers, withAttachmentDownloadUrls)
+  };
+}
+
+function publicResponse(response) {
+  return {
+    ...response,
+    answers: mapAnswerValues(response.answers, stripPrivateAttachmentData)
+  };
+}
+
+function mapAnswerValues(answers, mapper) {
+  return Object.fromEntries(Object.entries(answers || {}).map(([key, value]) => [key, mapper(value)]));
+}
+
+function filterResponses(responses, form, query, forcedStatus) {
+  const page = Math.max(1, Number(query.page) || 1);
+  const pageSize = Math.max(1, Math.min(100, Number(query.pageSize) || 50));
+  const search = String(query.search || '').trim().toLowerCase();
+  const from = query.from ? new Date(String(query.from)).getTime() : 0;
+  const to = query.to ? new Date(String(query.to)).getTime() : 0;
+  const status = String(forcedStatus || query.status || 'complete');
+  const filtered = responses
+    .filter((response) => response.formId === form.id && response.status === status)
+    .filter((response) => {
+      const created = new Date(response.createdAt).getTime();
+      if (from && created < from) return false;
+      if (to && created > to + 24 * 60 * 60 * 1000 - 1) return false;
+      if (!search) return true;
+      const haystack = [
+        response.clientId,
+        response.createdAt,
+        response.updatedAt,
+        ...form.fields.map((field) => displayAnswer(response.answers[field.id]))
+      ]
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(search);
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const total = filtered.length;
+  return {
+    items: filtered.slice((page - 1) * pageSize, page * pageSize),
+    page,
+    pageSize,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / pageSize))
+  };
 }
 
 function applyRetention(db) {
@@ -644,6 +682,7 @@ async function sendWebhook(form, response) {
   const log = {
     id: event.eventId,
     formId: form.id,
+    responseId: response.id,
     url: form.settings.webhookUrl,
     createdAt: event.createdAt,
     ok: false,
@@ -677,6 +716,13 @@ async function sendWebhookInBackground(form, response) {
   }
 }
 
+function formWebhookEvents(db, formId) {
+  return db.webhookEvents
+    .filter((event) => event.formId === formId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 100);
+}
+
 app.get('/api/auth/me', async (req, res) => {
   const state = await adminState();
   res.json({
@@ -686,7 +732,7 @@ app.get('/api/auth/me', async (req, res) => {
   });
 });
 
-app.post('/api/auth/setup', async (req, res) => {
+app.post('/api/auth/setup', authLimiter, async (req, res) => {
   const state = await adminState();
   if (state.configured) return res.status(409).json({ message: 'Admin password is already configured' });
   if (!canRunSetup(req)) return res.status(403).json({ message: 'Set ADMIN_PASSWORD or enable setup from the server console' });
@@ -700,7 +746,7 @@ app.post('/api/auth/setup', async (req, res) => {
   res.status(201).json({ ok: true });
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   const state = await adminState();
   if (!state.configured) return res.status(409).json({ message: 'Admin password is not configured' });
   if (!(await isAdminPassword(req.body.password))) return res.status(401).json({ message: 'Incorrect password' });
@@ -778,8 +824,8 @@ app.delete('/api/forms/:id', requireAdmin, async (req, res) => {
   res.status(204).end();
 });
 
-app.post('/api/forms/:id/partials', async (req, res) => {
-  const result = await updateDb((db) => {
+app.post('/api/forms/:id/partials', submissionLimiter, async (req, res) => {
+  const result = await updateDb(async (db) => {
     const form = findForm(db, req.params.id);
     if (!form || !form.published || !form.settings.partialSubmissions) return { error: 'Partial submissions disabled', status: 404 };
     const answers = calculateFields(form, req.body.answers || {});
@@ -788,8 +834,8 @@ app.post('/api/forms/:id/partials', async (req, res) => {
 
     const existing = db.responses.find((item) => item.formId === form.id && item.clientId === clientId && item.status === 'partial');
     if (existing) {
-      existing.answers = { ...existing.answers, ...answers };
       existing.updatedAt = now();
+      existing.answers = await materializeAnswers(form, existing, { ...existing.answers, ...answers });
       return { response: existing, status: 200 };
     }
 
@@ -802,15 +848,16 @@ app.post('/api/forms/:id/partials', async (req, res) => {
       createdAt: now(),
       updatedAt: now()
     };
+    response.answers = await materializeAnswers(form, response, response.answers);
     db.responses.push(response);
     return { response, status: 201 };
   });
   if (result?.error) return res.status(result.status).json({ message: result.error });
   if (result?.empty) return res.status(204).end();
-  if (result.response) return res.status(result.status).json(result.response);
+  if (result.response) return res.status(result.status).json(publicResponse(result.response));
 });
 
-app.post('/api/forms/:id/responses', async (req, res) => {
+app.post('/api/forms/:id/responses', submissionLimiter, async (req, res) => {
   const result = await updateDb(async (db) => {
     const form = findForm(db, req.params.id);
     if (!form || !form.published) return { error: 'Form is not public', status: 404 };
@@ -843,13 +890,14 @@ app.post('/api/forms/:id/responses', async (req, res) => {
     };
 
     db.responses = db.responses.filter((item) => !(item.formId === form.id && item.clientId === clientId && item.status === 'partial'));
+    response.answers = await materializeAnswers(form, response, response.answers);
     db.responses.push(response);
     const webhookForm = form.settings.webhookUrl ? JSON.parse(JSON.stringify(form)) : null;
     return { response, status: 201, webhookForm };
   });
   if (result.error) return res.status(result.status).json({ message: result.error });
   if (result.errors) return res.status(result.status).json({ errors: result.errors });
-  res.status(result.status).json(result.response);
+  res.status(result.status).json(publicResponse(result.response));
   if (result.webhookForm) void sendWebhookInBackground(result.webhookForm, result.response);
 });
 
@@ -857,14 +905,29 @@ app.get('/api/forms/:id/responses', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).json({ message: 'Form not found' });
-  res.json(db.responses.filter((item) => item.formId === form.id && item.status === 'complete').sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  res.json(filterResponses(db.responses, form, req.query, 'complete').items.map(adminResponse));
 });
 
 app.get('/api/forms/:id/partials', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
   if (!form) return res.status(404).json({ message: 'Form not found' });
-  res.json(db.responses.filter((item) => item.formId === form.id && item.status === 'partial').sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+  res.json(filterResponses(db.responses, form, req.query, 'partial').items.map(adminResponse));
+});
+
+app.get('/api/forms/:id/responses/page', requireAdmin, async (req, res) => {
+  const db = await readDb();
+  const form = findForm(db, req.params.id);
+  if (!form) return res.status(404).json({ message: 'Form not found' });
+  const result = filterResponses(db.responses, form, req.query, req.query.status || 'complete');
+  res.json({ ...result, items: result.items.map(adminResponse) });
+});
+
+app.get('/api/forms/:id/webhooks', requireAdmin, async (req, res) => {
+  const db = await readDb();
+  const form = findForm(db, req.params.id);
+  if (!form) return res.status(404).json({ message: 'Form not found' });
+  res.json(formWebhookEvents(db, form.id));
 });
 
 app.get('/api/forms/:id/responses.csv', requireAdmin, async (req, res) => {
@@ -891,19 +954,49 @@ app.get('/api/forms/:id/partials.csv', requireAdmin, async (req, res) => {
   res.send(`\uFEFF${csv}`);
 });
 
+app.get('/api/attachments/:id', requireAdmin, async (req, res) => {
+  const attachment = await getAttachment(req.params.id);
+  if (!attachment) return res.status(404).json({ message: 'Attachment not found' });
+  const absolutePath = getUploadAbsolutePath(attachment.relativePath);
+  if (!absolutePath) return res.status(404).json({ message: 'Attachment not found' });
+  try {
+    await fs.access(absolutePath);
+  } catch {
+    return res.status(404).json({ message: 'Attachment not found' });
+  }
+  res.setHeader('Content-Type', attachment.mime || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(attachment.name || 'attachment').replaceAll('"', '')}"`);
+  res.sendFile(absolutePath);
+});
+
 async function configureStaticRoutes() {
   try {
     await fs.access(distDir);
     app.use(express.static(distDir));
-    app.use((_req, res) => res.sendFile(path.join(distDir, 'index.html')));
+    app.use((req, res) => {
+      if (req.path.startsWith('/api/')) return res.status(404).json({ message: 'API route not found' });
+      return res.sendFile(path.join(distDir, 'index.html'));
+    });
   } catch {
     app.get('/', (_req, res) => {
       res.send('Mini Tally API is running. Start the Vite dev server with npm run dev.');
     });
+    app.use((req, res) => {
+      if (req.path.startsWith('/api/')) return res.status(404).json({ message: 'API route not found' });
+      return res.status(404).send('Mini Tally frontend is not built. Run npm run build.');
+    });
   }
 }
 
+app.use((error, req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next(error);
+  console.error('API error:', error);
+  if (res.headersSent) return next(error);
+  return res.status(500).json({ message: 'Something went wrong. Please try again.' });
+});
+
 async function start() {
+  await ensureStore();
   await configureStaticRoutes();
   console.log(`Starting Mini Tally with Node ${process.version}, port ${port}, host ${listenHost}`);
 

@@ -96,10 +96,13 @@ export type Form = {
 };
 
 export type FileAnswer = {
+  attachmentId?: string;
   name: string;
   type: string;
   size: number;
-  dataUrl: string;
+  dataUrl?: string;
+  downloadUrl?: string;
+  createdAt?: string;
 };
 
 export type AnswerValue = string | string[] | Record<string, string> | FileAnswer | FileAnswer[] | null;
@@ -118,4 +121,23 @@ export type AuthState = {
   configured: boolean;
   authenticated: boolean;
   setupAllowed?: boolean;
+};
+
+export type ResponsePage = {
+  items: FormResponse[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+};
+
+export type WebhookEvent = {
+  id: string;
+  formId: string;
+  responseId: string;
+  url: string;
+  ok: boolean;
+  status: number;
+  message: string;
+  createdAt: string;
 };

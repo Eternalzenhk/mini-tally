@@ -12,6 +12,8 @@ npm run server
 
 Open http://127.0.0.1:4177.
 
+Use Node.js 22 or newer. The production data layer uses Node's built-in `node:sqlite` module, so no native SQLite package is required.
+
 The management workspace is protected by an admin password. On first local run, open the app from `localhost` or `127.0.0.1` and create the password on screen. The public `/form/...` links still work without admin login.
 
 ## Admin Security
@@ -28,11 +30,11 @@ NODE_ENV="production"
 
 `ADMIN_PASSWORD` lets you log in without creating a local `data/admin.json` file. `ADMIN_SESSION_SECRET` keeps admin sessions valid after restarts. If you prefer the setup screen on a server, temporarily set `ALLOW_ADMIN_SETUP=true`, create the password immediately, then remove that variable.
 
-Never commit `data/admin.json` or `data/forms.json`. They can contain password hashes, submissions, and uploaded file data.
+Never commit `data/admin.json`, `data/forms.json`, `data/mini-tally.sqlite*`, or `data/uploads`. They can contain password hashes, submissions, and uploaded file data.
 
 ## Hostinger Deployment
 
-This app needs Hostinger Node.js hosting, not static file hosting, because it has an Express API and stores form data in `data/forms.json`.
+This app needs Hostinger Node.js hosting, not static file hosting, because it has an Express API, a SQLite database, and private uploaded files.
 
 Suggested hPanel settings:
 
@@ -41,7 +43,7 @@ Suggested hPanel settings:
 - Install command: `npm install`
 - Build command: `npm run build`
 - Start command: `npm start`
-- Node version: 20+ if available
+- Node version: 22+
 
 Upload the project files without `node_modules`. The app listens on Hostinger's `PORT` environment variable automatically.
 
@@ -75,7 +77,7 @@ $env:HOSTINGER_SSH_KEY="$env:USERPROFILE\.ssh\id_ed25519"
 npm run deploy:hostinger
 ```
 
-The current SSH deploy script builds the app, uploads a `.tar.gz` release to the Hostinger Node.js app folder, preserves the remote `data` folder unless `-IncludeLocalData` is used, touches `tmp/restart.txt`, and optionally checks `HOSTINGER_APP_URL`.
+The current SSH deploy script builds the app, uploads a `.tar.gz` release to the Hostinger Node.js app folder, preserves the remote `data` folder unless `-IncludeLocalData` is used, backs up the full `data` folder before release install, keeps the latest 7 backups, touches `tmp/restart.txt`, and optionally checks `HOSTINGER_APP_URL` plus `/api/auth/me`.
 
 Before deploying the protected workspace to Hostinger, make sure the Hostinger Node.js app has `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET`, and `NODE_ENV=production` configured. Otherwise the public forms will load, but the management workspace will not be ready for login from the public domain.
 
@@ -97,7 +99,12 @@ Before deploying the protected workspace to Hostinger, make sure the Hostinger N
 - Response and partial-submission CSV export
 - Theme editor and custom CSS
 - Webhook posting with optional HMAC signature
+- Webhook delivery log in the results workspace
 - Local data retention cleanup
+- SQLite storage with automatic legacy `forms.json` migration
+- File uploads stored under `data/uploads` with protected admin downloads
+- Result search, date filters, and paged response loading
+- Basic rate limits on admin login/setup and public submission endpoints
 
 ## Local Limitations
 
@@ -111,4 +118,24 @@ Some Tally SaaS features need external services to be truly complete:
 
 ## Data
 
-Form definitions, submissions, partial submissions, and webhook logs are stored in `data/forms.json`.
+Form definitions, submissions, partial submissions, answers, webhook logs, and admin config are stored in `data/mini-tally.sqlite`.
+
+On first launch, if `data/mini-tally.sqlite` does not exist but `data/forms.json` exists, the server migrates the legacy JSON data into SQLite and creates a timestamped `data/forms.json.migrated-*.bak` backup. Existing public form URLs are preserved.
+
+Uploaded files are stored in `data/uploads/<formId>/<responseId>/...`. The database stores only file metadata and relative paths. Attachment downloads require admin login.
+
+Do not commit `data/mini-tally.sqlite*`, `data/uploads`, `data/admin.json`, or legacy `data/forms.json` because they may contain private response data.
+
+## Backup And Restore
+
+The SSH deploy script creates timestamped backups in `.deploy-backup-*` inside the Hostinger app folder before every release. Each backup contains the previous `data` folder, including `mini-tally.sqlite`, SQLite WAL/SHM sidecar files, uploads, and legacy admin/form JSON files.
+
+To restore from SSH, stop the app from hPanel or touch restart after restore, then copy a backup data folder back into place:
+
+```bash
+cd /home/your-user/apps/mini-tally
+cp -a .deploy-backup-YYYYMMDDHHMMSS/data ./data
+touch tmp/restart.txt
+```
+
+Keep `data/mini-tally.sqlite`, `data/mini-tally.sqlite-wal`, `data/mini-tally.sqlite-shm`, and `data/uploads` together when moving or restoring production data.

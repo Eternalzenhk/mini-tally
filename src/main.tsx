@@ -29,7 +29,7 @@ import {
   Workflow
 } from 'lucide-react';
 import { api } from './api';
-import type { AnswerValue, AuthState, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme } from './types';
+import type { AnswerValue, AuthState, FieldType, FileAnswer, Form, FormField, FormResponse, FormSettings, FormTheme, ResponsePage, WebhookEvent } from './types';
 import {
   absoluteEmbedUrl,
   absolutePublicUrl,
@@ -126,6 +126,15 @@ const text = {
     noResponses: 'No complete responses yet.',
     noPartials: 'No partial submissions saved.',
     submitted: 'Submitted',
+    searchResponses: 'Search responses',
+    fromDate: 'From date',
+    toDate: 'To date',
+    pageNext: 'Next',
+    pagePrevious: 'Previous',
+    downloadAttachment: 'Download',
+    webhookDeliveries: 'Webhook deliveries',
+    noWebhooks: 'No webhook deliveries yet.',
+    webhookStatus: 'Status',
     settingsTitle: 'Settings',
     settingsText: 'Control access, submission limits, notifications, webhooks, and data retention.',
     customSlug: 'Custom slug',
@@ -246,6 +255,15 @@ const text = {
     noResponses: '還沒有完整回覆。',
     noPartials: '還沒有儲存的部分填答。',
     submitted: '提交時間',
+    searchResponses: '搜尋回覆',
+    fromDate: '開始日期',
+    toDate: '結束日期',
+    pageNext: '下一頁',
+    pagePrevious: '上一頁',
+    downloadAttachment: '下載',
+    webhookDeliveries: 'Webhook 傳送紀錄',
+    noWebhooks: '還沒有 webhook 傳送紀錄。',
+    webhookStatus: '狀態',
     settingsTitle: '設定',
     settingsText: '控制存取、提交限制、通知、webhook 與資料保留。',
     customSlug: '自訂網址代稱',
@@ -525,6 +543,8 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
   const [draft, setDraft] = useState<Form | null>(null);
   const [responses, setResponses] = useState<FormResponse[]>([]);
   const [partials, setPartials] = useState<FormResponse[]>([]);
+  const [responsePage, setResponsePage] = useState<ResponsePage | null>(null);
+  const [partialPage, setPartialPage] = useState<ResponsePage | null>(null);
   const [tab, setTab] = useState<WorkspaceTab>('build');
   const [status, setStatus] = useState<string>(t.ready);
   const [saving, setSaving] = useState(false);
@@ -567,9 +587,14 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
   }
 
   async function loadResponses(formId: string) {
-    const [nextResponses, nextPartials] = await Promise.all([api.listResponses(formId), api.listPartials(formId)]);
-    setResponses(nextResponses);
-    setPartials(nextPartials);
+    const [nextResponses, nextPartials] = await Promise.all([
+      api.listResponsePage(formId, { status: 'complete', page: 1, pageSize: 50 }),
+      api.listResponsePage(formId, { status: 'partial', page: 1, pageSize: 50 })
+    ]);
+    setResponsePage(nextResponses);
+    setPartialPage(nextPartials);
+    setResponses(nextResponses.items);
+    setPartials(nextPartials.items);
   }
 
   async function createNewForm() {
@@ -766,7 +791,24 @@ function Workspace({ navigate, onLogout }: { navigate: (path: string) => void; o
           {tab === 'logic' && <LogicPanel form={draft} updateDraft={updateDraft} saveDraft={saveDraft} />}
           {tab === 'design' && <DesignPanel form={draft} updateDraft={updateDraft} saveDraft={saveDraft} />}
           {tab === 'share' && <SharePanel form={draft} copyPublicLink={copyPublicLink} navigate={navigate} />}
-          {tab === 'results' && <ResultsPanel form={draft} responses={responses} partials={partials} reload={() => loadResponses(draft.id)} />}
+          {tab === 'results' && (
+            <ResultsPanel
+              form={draft}
+              responses={responses}
+              partials={partials}
+              responsePage={responsePage}
+              partialPage={partialPage}
+              onResponsesChange={(page) => {
+                setResponsePage(page);
+                setResponses(page.items);
+              }}
+              onPartialsChange={(page) => {
+                setPartialPage(page);
+                setPartials(page.items);
+              }}
+              reload={() => loadResponses(draft.id)}
+            />
+          )}
           {tab === 'settings' && <SettingsPanel form={draft} updateDraft={updateDraft} saveDraft={saveDraft} />}
 
           <div className="status-bar">
@@ -1331,15 +1373,53 @@ function ResultsPanel({
   form,
   responses,
   partials,
+  responsePage,
+  partialPage,
+  onResponsesChange,
+  onPartialsChange,
   reload
 }: {
   form: Form;
   responses: FormResponse[];
   partials: FormResponse[];
+  responsePage: ResponsePage | null;
+  partialPage: ResponsePage | null;
+  onResponsesChange: (page: ResponsePage) => void;
+  onPartialsChange: (page: ResponsePage) => void;
   reload: () => void;
 }) {
   const { t } = useI18n();
-  const completionRate = responses.length + partials.length === 0 ? 0 : Math.round((responses.length / (responses.length + partials.length)) * 100);
+  const [filters, setFilters] = useState({ search: '', from: '', to: '' });
+  const [webhooks, setWebhooks] = useState<WebhookEvent[]>([]);
+  const responseTotal = responsePage?.total ?? responses.length;
+  const partialTotal = partialPage?.total ?? partials.length;
+  const completionRate = responseTotal + partialTotal === 0 ? 0 : Math.round((responseTotal / (responseTotal + partialTotal)) * 100);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.listWebhooks(form.id)
+      .then((events) => {
+        if (!cancelled) setWebhooks(events);
+      })
+      .catch(() => {
+        if (!cancelled) setWebhooks([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form.id, responses.length]);
+
+  async function loadPage(status: 'complete' | 'partial', page = 1) {
+    const nextPage = await api.listResponsePage(form.id, { status, ...filters, page, pageSize: 50 });
+    if (status === 'complete') onResponsesChange(nextPage);
+    else onPartialsChange(nextPage);
+  }
+
+  async function applyFilters(event: React.FormEvent) {
+    event.preventDefault();
+    await Promise.all([loadPage('complete', 1), loadPage('partial', 1)]);
+  }
+
   return (
     <section className="responses-pane">
       <div className="responses-head">
@@ -1365,12 +1445,32 @@ function ResultsPanel({
 
       <div className="metrics-row">
         <Metric label={t.completion} value={`${completionRate}%`} />
-        <Metric label={t.partials} value={String(partials.length)} />
+        <Metric label={t.partials} value={String(partialTotal)} />
         <Metric label={t.fields} value={String(form.fields.length)} />
       </div>
 
-      <ResponseTable title={t.responseTitle} form={form} responses={responses} empty={t.noResponses} />
-      <ResponseTable title={t.partialTitle} form={form} responses={partials} empty={t.noPartials} />
+      <form className="results-filters" onSubmit={(event) => void applyFilters(event)}>
+        <label className="stack-label">
+          {t.searchResponses}
+          <input value={filters.search} onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))} />
+        </label>
+        <label className="stack-label">
+          {t.fromDate}
+          <input type="date" value={filters.from} onChange={(event) => setFilters((current) => ({ ...current, from: event.target.value }))} />
+        </label>
+        <label className="stack-label">
+          {t.toDate}
+          <input type="date" value={filters.to} onChange={(event) => setFilters((current) => ({ ...current, to: event.target.value }))} />
+        </label>
+        <button className="text-button" type="submit">
+          <Clipboard size={17} />
+          {t.refresh}
+        </button>
+      </form>
+
+      <ResponseTable title={t.responseTitle} form={form} responses={responses} page={responsePage} empty={t.noResponses} onPage={(page) => void loadPage('complete', page)} />
+      <ResponseTable title={t.partialTitle} form={form} responses={partials} page={partialPage} empty={t.noPartials} onPage={(page) => void loadPage('partial', page)} />
+      <WebhookLog events={webhooks} />
     </section>
   );
 }
@@ -1384,11 +1484,40 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ResponseTable({ title, form, responses, empty }: { title: string; form: Form; responses: FormResponse[]; empty: string }) {
+function ResponseTable({
+  title,
+  form,
+  responses,
+  page,
+  empty,
+  onPage
+}: {
+  title: string;
+  form: Form;
+  responses: FormResponse[];
+  page: ResponsePage | null;
+  empty: string;
+  onPage: (page: number) => void;
+}) {
   const { t } = useI18n();
   return (
     <div className="results-section">
-      <h3>{title}</h3>
+      <div className="results-section-head">
+        <h3>{title}</h3>
+        {page && (
+          <div className="pager">
+            <button className="text-button" type="button" disabled={page.page <= 1} onClick={() => onPage(page.page - 1)}>
+              {t.pagePrevious}
+            </button>
+            <span>
+              {page.page}/{page.totalPages} · {page.total}
+            </span>
+            <button className="text-button" type="button" disabled={page.page >= page.totalPages} onClick={() => onPage(page.page + 1)}>
+              {t.pageNext}
+            </button>
+          </div>
+        )}
+      </div>
       {responses.length === 0 ? (
         <div className="quiet-empty">{empty}</div>
       ) : (
@@ -1407,7 +1536,7 @@ function ResponseTable({ title, form, responses, empty }: { title: string; form:
                 <tr key={response.id}>
                   <td>{formatDate(response.createdAt)}</td>
                   {form.fields.map((field) => (
-                    <td key={field.id}>{displayAnswer(response.answers[field.id])}</td>
+                    <td key={field.id}>{renderAnswer(response.answers[field.id], t.downloadAttachment)}</td>
                   ))}
                 </tr>
               ))}
@@ -1417,6 +1546,53 @@ function ResponseTable({ title, form, responses, empty }: { title: string; form:
       )}
     </div>
   );
+}
+
+function WebhookLog({ events }: { events: WebhookEvent[] }) {
+  const { t } = useI18n();
+  return (
+    <div className="results-section">
+      <div className="results-section-head">
+        <h3>{t.webhookDeliveries}</h3>
+      </div>
+      {events.length === 0 ? (
+        <div className="quiet-empty">{t.noWebhooks}</div>
+      ) : (
+        <div className="webhook-log-list">
+          {events.map((event) => (
+            <div className="webhook-log-row" key={event.id}>
+              <span className={event.ok ? 'status-pill ok' : 'status-pill failed'}>{event.ok ? 'OK' : 'Failed'}</span>
+              <strong>{event.status || '-'}</strong>
+              <span>{event.message || t.webhookStatus}</span>
+              <time>{formatDate(event.createdAt)}</time>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function renderAnswer(value: AnswerValue, downloadLabel: string): React.ReactNode {
+  const files = normalizeFiles(value);
+  if (files.length) {
+    return (
+      <div className="attachment-result-list">
+        {files.map((file, index) =>
+          file.downloadUrl ? (
+            <a key={`${file.name}-${index}`} href={file.downloadUrl} className="attachment-result-link">
+              <Download size={14} />
+              <span>{file.name}</span>
+              <small>{downloadLabel}</small>
+            </a>
+          ) : (
+            <span key={`${file.name}-${index}`}>{file.name}</span>
+          )
+        )}
+      </div>
+    );
+  }
+  return displayAnswer(value);
 }
 
 function SettingsPanel({
@@ -1991,10 +2167,14 @@ function AttachmentInput({
 function normalizeFiles(value: AnswerValue): FileAnswer[] {
   if (!value) return [];
   if (Array.isArray(value)) {
-    return value.filter((item): item is FileAnswer => typeof item === 'object' && item !== null && 'name' in item && 'dataUrl' in item);
+    return value.filter((item): item is FileAnswer => isFileAnswer(item));
   }
-  if (typeof value === 'object' && 'name' in value && 'dataUrl' in value) return [value as FileAnswer];
+  if (isFileAnswer(value)) return [value];
   return [];
+}
+
+function isFileAnswer(value: unknown): value is FileAnswer {
+  return typeof value === 'object' && value !== null && 'name' in value && ('dataUrl' in value || 'downloadUrl' in value || 'attachmentId' in value);
 }
 
 function readFileAnswer(file: File): Promise<FileAnswer> {

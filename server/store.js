@@ -1,0 +1,647 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const rootDir = path.resolve(__dirname, '..');
+export const dataDir = path.join(rootDir, 'data');
+export const sqlitePath = path.join(dataDir, 'mini-tally.sqlite');
+export const legacyFormsPath = path.join(dataDir, 'forms.json');
+export const legacyAdminPath = path.join(dataDir, 'admin.json');
+export const uploadsDir = path.join(dataDir, 'uploads');
+
+let database;
+let initPromise;
+let dbQueue = Promise.resolve();
+
+const allowedFileExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.csv', '.txt', '.zip']);
+const allowedFileMimes = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/csv',
+  'text/plain',
+  'application/zip',
+  'application/x-zip-compressed'
+]);
+
+export function getUploadAbsolutePath(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/');
+  if (!normalized.startsWith('uploads/')) return '';
+  const resolved = path.resolve(dataDir, normalized);
+  return resolved.startsWith(path.resolve(uploadsDir)) ? resolved : '';
+}
+
+export async function ensureStore() {
+  if (!initPromise) {
+    initPromise = initializeStore();
+  }
+  await initPromise;
+}
+
+async function initializeStore() {
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.mkdir(uploadsDir, { recursive: true });
+  database = new DatabaseSync(sqlitePath);
+  database.exec('PRAGMA journal_mode = WAL');
+  database.exec('PRAGMA foreign_keys = ON');
+  database.exec('PRAGMA busy_timeout = 5000');
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS forms (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      published INTEGER NOT NULL DEFAULT 0,
+      starred INTEGER NOT NULL DEFAULT 0,
+      settings_json TEXT NOT NULL,
+      theme_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS fields (
+      id TEXT NOT NULL,
+      form_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      label TEXT NOT NULL,
+      type TEXT NOT NULL,
+      required INTEGER NOT NULL DEFAULT 0,
+      description TEXT NOT NULL DEFAULT '',
+      placeholder TEXT NOT NULL DEFAULT '',
+      default_value TEXT NOT NULL DEFAULT '',
+      options_json TEXT NOT NULL DEFAULT '[]',
+      rows_json TEXT NOT NULL DEFAULT '[]',
+      columns_json TEXT NOT NULL DEFAULT '[]',
+      min_value REAL NOT NULL DEFAULT 0,
+      max_value REAL NOT NULL DEFAULT 10,
+      step_value REAL NOT NULL DEFAULT 1,
+      formula TEXT NOT NULL DEFAULT '',
+      price REAL NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT '',
+      visibility_json TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (form_id, id),
+      FOREIGN KEY (form_id) REFERENCES forms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS responses (
+      id TEXT PRIMARY KEY,
+      form_id TEXT NOT NULL,
+      client_id TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (form_id) REFERENCES forms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS answers (
+      response_id TEXT NOT NULL,
+      field_id TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      PRIMARY KEY (response_id, field_id),
+      FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      response_id TEXT NOT NULL,
+      field_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      mime TEXT NOT NULL DEFAULT '',
+      size INTEGER NOT NULL DEFAULT 0,
+      relative_path TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (response_id) REFERENCES responses(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      id TEXT PRIMARY KEY,
+      form_id TEXT NOT NULL,
+      response_id TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL DEFAULT '',
+      ok INTEGER NOT NULL DEFAULT 0,
+      status INTEGER NOT NULL DEFAULT 0,
+      message TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      password_hash TEXT,
+      session_secret TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_fields_form_sort ON fields(form_id, sort_order);
+    CREATE INDEX IF NOT EXISTS idx_responses_form_status_created ON responses(form_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_attachments_response ON attachments(response_id);
+  `);
+
+  await migrateLegacyFormsIfNeeded();
+  await migrateLegacyAdminIfNeeded();
+}
+
+async function migrateLegacyFormsIfNeeded() {
+  const existing = database.prepare('SELECT COUNT(*) AS count FROM forms').get();
+  if (Number(existing?.count || 0) > 0 || !fsSync.existsSync(legacyFormsPath)) return;
+
+  const raw = (await fs.readFile(legacyFormsPath, 'utf8')).replace(/^\uFEFF/, '');
+  const legacy = JSON.parse(raw);
+  const data = {
+    forms: Array.isArray(legacy.forms) ? legacy.forms : [],
+    responses: Array.isArray(legacy.responses) ? legacy.responses : [],
+    webhookEvents: Array.isArray(legacy.webhookEvents) ? legacy.webhookEvents : []
+  };
+  await materializeAllAttachments(data);
+  writeDbToSqlite(data);
+
+  const stamp = timestampForFile();
+  await fs.copyFile(legacyFormsPath, `${legacyFormsPath}.migrated-${stamp}.bak`);
+}
+
+async function migrateLegacyAdminIfNeeded() {
+  const existing = database.prepare('SELECT password_hash FROM admin_config WHERE id = 1').get();
+  if (existing?.password_hash || !fsSync.existsSync(legacyAdminPath)) return;
+
+  const raw = (await fs.readFile(legacyAdminPath, 'utf8')).replace(/^\uFEFF/, '');
+  const config = JSON.parse(raw);
+  if (!config?.passwordHash) return;
+  database
+    .prepare(
+      `INSERT OR REPLACE INTO admin_config (id, password_hash, session_secret, created_at, updated_at)
+       VALUES (1, ?, ?, ?, ?)`
+    )
+    .run(config.passwordHash, config.sessionSecret || crypto.randomBytes(32).toString('base64url'), config.createdAt || now(), config.updatedAt || now());
+}
+
+export async function readDb() {
+  await ensureStore();
+  return readDbFromSqlite();
+}
+
+export async function writeDb(data) {
+  await ensureStore();
+  await materializeAllAttachments(data);
+  writeDbToSqlite(data);
+}
+
+export function updateDb(mutator) {
+  const next = dbQueue.then(async () => {
+    await ensureStore();
+    const db = readDbFromSqlite();
+    const result = await mutator(db);
+    await materializeAllAttachments(db);
+    writeDbToSqlite(db);
+    return result;
+  });
+  dbQueue = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
+}
+
+export async function readAdminConfig() {
+  await ensureStore();
+  const row = database.prepare('SELECT password_hash, session_secret, created_at, updated_at FROM admin_config WHERE id = 1').get();
+  if (!row?.password_hash) return null;
+  return {
+    passwordHash: row.password_hash,
+    sessionSecret: row.session_secret,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+export async function writeAdminConfig(config) {
+  await ensureStore();
+  const existing = database.prepare('SELECT session_secret, created_at FROM admin_config WHERE id = 1').get();
+  const sessionSecret = config.sessionSecret || existing?.session_secret || crypto.randomBytes(32).toString('base64url');
+  const createdAt = config.createdAt || existing?.created_at || now();
+  const updatedAt = config.updatedAt || now();
+  database
+    .prepare(
+      `INSERT OR REPLACE INTO admin_config (id, password_hash, session_secret, created_at, updated_at)
+       VALUES (1, ?, ?, ?, ?)`
+    )
+    .run(config.passwordHash || null, sessionSecret, createdAt, updatedAt);
+}
+
+export async function getAttachment(id) {
+  await ensureStore();
+  return database
+    .prepare('SELECT id, response_id AS responseId, field_id AS fieldId, name, mime, size, relative_path AS relativePath, created_at AS createdAt FROM attachments WHERE id = ?')
+    .get(id);
+}
+
+function readDbFromSqlite() {
+  const forms = database
+    .prepare('SELECT id, title, description, published, starred, settings_json, theme_json, created_at, updated_at FROM forms ORDER BY updated_at DESC')
+    .all()
+    .map((row) => {
+      const fields = database
+        .prepare('SELECT * FROM fields WHERE form_id = ? ORDER BY sort_order ASC')
+        .all(row.id)
+        .map(fieldFromRow);
+      return {
+        id: row.id,
+        title: row.title,
+        description: row.description || '',
+        published: Boolean(row.published),
+        starred: Boolean(row.starred),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        fields,
+        settings: parseJson(row.settings_json, {}),
+        theme: parseJson(row.theme_json, {})
+      };
+    });
+
+  const attachments = database.prepare('SELECT * FROM attachments').all();
+  const attachmentsByResponseField = new Map();
+  for (const item of attachments) {
+    const key = `${item.response_id}:${item.field_id}`;
+    if (!attachmentsByResponseField.has(key)) attachmentsByResponseField.set(key, []);
+    attachmentsByResponseField.get(key).push(attachmentFromRow(item));
+  }
+
+  const responses = database
+    .prepare('SELECT id, form_id, client_id, status, created_at, updated_at FROM responses ORDER BY created_at DESC')
+    .all()
+    .map((row) => {
+      const answers = {};
+      const answerRows = database.prepare('SELECT field_id, value_json FROM answers WHERE response_id = ?').all(row.id);
+      for (const answer of answerRows) {
+        const parsed = parseJson(answer.value_json, null);
+        answers[answer.field_id] = mergeAttachmentMetadata(parsed, attachmentsByResponseField.get(`${row.id}:${answer.field_id}`) || []);
+      }
+      return {
+        id: row.id,
+        formId: row.form_id,
+        clientId: row.client_id || '',
+        answers,
+        status: row.status,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+    });
+
+  const webhookEvents = database
+    .prepare('SELECT id, form_id, response_id, url, ok, status, message, created_at FROM webhook_events ORDER BY created_at DESC')
+    .all()
+    .map((row) => ({
+      id: row.id,
+      formId: row.form_id,
+      responseId: row.response_id || '',
+      url: row.url || '',
+      ok: Boolean(row.ok),
+      status: Number(row.status) || 0,
+      message: row.message || '',
+      createdAt: row.created_at
+    }));
+
+  return { forms, responses, webhookEvents };
+}
+
+function writeDbToSqlite(data) {
+  runTransaction((nextData) => {
+    database.exec('DELETE FROM answers; DELETE FROM attachments; DELETE FROM responses; DELETE FROM fields; DELETE FROM forms; DELETE FROM webhook_events;');
+
+    const insertForm = database.prepare(
+      `INSERT INTO forms (id, title, description, published, starred, settings_json, theme_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertField = database.prepare(
+      `INSERT INTO fields (
+        id, form_id, key, label, type, required, description, placeholder, default_value,
+        options_json, rows_json, columns_json, min_value, max_value, step_value,
+        formula, price, currency, visibility_json, sort_order
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertResponse = database.prepare(
+      `INSERT INTO responses (id, form_id, client_id, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    const insertAnswer = database.prepare('INSERT INTO answers (response_id, field_id, value_json) VALUES (?, ?, ?)');
+    const insertAttachment = database.prepare(
+      `INSERT INTO attachments (id, response_id, field_id, name, mime, size, relative_path, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertWebhook = database.prepare(
+      `INSERT INTO webhook_events (id, form_id, response_id, url, ok, status, message, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    for (const form of nextData.forms || []) {
+      insertForm.run(
+        form.id,
+        form.title || 'Untitled form',
+        form.description || '',
+        form.published ? 1 : 0,
+        form.starred ? 1 : 0,
+        stringifyJson(form.settings || {}),
+        stringifyJson(form.theme || {}),
+        form.createdAt || now(),
+        form.updatedAt || form.createdAt || now()
+      );
+      (form.fields || []).forEach((field, index) => {
+        insertField.run(
+          field.id,
+          form.id,
+          field.key || field.id,
+          field.label || '',
+          field.type || 'short_text',
+          field.required ? 1 : 0,
+          field.description || '',
+          field.placeholder || '',
+          field.defaultValue || '',
+          stringifyJson(field.options || []),
+          stringifyJson(field.rows || []),
+          stringifyJson(field.columns || []),
+          Number(field.min) || 0,
+          Number(field.max) || 0,
+          Number(field.step) || 1,
+          field.formula || '',
+          Number(field.price) || 0,
+          field.currency || '',
+          field.visibility ? stringifyJson(field.visibility) : null,
+          index
+        );
+      });
+    }
+
+    for (const response of nextData.responses || []) {
+      insertResponse.run(response.id, response.formId, response.clientId || '', response.status || 'complete', response.createdAt || now(), response.updatedAt || response.createdAt || now());
+      for (const [fieldId, value] of Object.entries(response.answers || {})) {
+        insertAnswer.run(response.id, fieldId, stringifyJson(stripDownloadUrls(value)));
+        for (const attachment of attachmentsFromValue(value)) {
+          if (!attachment.relativePath) continue;
+          insertAttachment.run(
+            attachment.attachmentId || attachment.id,
+            response.id,
+            fieldId,
+            attachment.name || 'attachment',
+            attachment.type || attachment.mime || '',
+            Number(attachment.size) || 0,
+            attachment.relativePath,
+            attachment.createdAt || response.createdAt || now()
+          );
+        }
+      }
+    }
+
+    for (const event of nextData.webhookEvents || []) {
+      insertWebhook.run(event.id, event.formId || '', event.responseId || '', event.url || '', event.ok ? 1 : 0, Number(event.status) || 0, event.message || '', event.createdAt || now());
+    }
+  }, data || { forms: [], responses: [], webhookEvents: [] });
+}
+
+function runTransaction(callback, value) {
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const result = callback(value);
+    database.exec('COMMIT');
+    return result;
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+async function materializeAllAttachments(data) {
+  const formsById = new Map((data.forms || []).map((form) => [form.id, form]));
+  for (const response of data.responses || []) {
+    const form = formsById.get(response.formId);
+    if (!form) continue;
+    response.answers = await materializeAnswers(form, response, response.answers || {});
+  }
+}
+
+export async function materializeAnswers(form, response, answers) {
+  const nextAnswers = { ...answers };
+  for (const field of form.fields || []) {
+    if (!['file_upload', 'signature'].includes(field.type)) continue;
+    if (!(field.id in nextAnswers)) continue;
+    nextAnswers[field.id] = await materializeFileValue(form, response, field, nextAnswers[field.id]);
+  }
+  return nextAnswers;
+}
+
+async function materializeFileValue(form, response, field, value) {
+  if (!value) return value;
+  if (Array.isArray(value)) {
+    const files = [];
+    for (const item of value) {
+      const next = await materializeOneFile(form, response, field, item);
+      if (next) files.push(next);
+    }
+    return files;
+  }
+  return materializeOneFile(form, response, field, value);
+}
+
+async function materializeOneFile(form, response, field, value) {
+  if (!isObject(value)) return value;
+  if (!value.dataUrl) return value;
+  const decoded = decodeDataUrl(value.dataUrl);
+  const name = sanitizeFileName(value.name || 'attachment');
+  const mime = String(value.type || decoded.mime || mimeFromName(name) || '');
+  const size = decoded.buffer.length;
+  assertAllowedAttachment(field, { name, mime, size });
+
+  const attachmentId = value.attachmentId || id('att');
+  const safeName = `${attachmentId}-${name}`;
+  const relativePath = path.posix.join('uploads', form.id, response.id, safeName);
+  const absolutePath = getUploadAbsolutePath(relativePath);
+  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+  await fs.writeFile(absolutePath, decoded.buffer, { flag: 'wx' }).catch(async (error) => {
+    if (error?.code !== 'EEXIST') throw error;
+  });
+
+  return {
+    attachmentId,
+    name: value.name || name,
+    type: mime,
+    size,
+    relativePath,
+    createdAt: response.createdAt || now()
+  };
+}
+
+export function validateAttachmentValue(field, value) {
+  const files = Array.isArray(value) ? value : value ? [value] : [];
+  if (files.length > 10) return 'Upload up to 10 files';
+  for (const file of files) {
+    if (!isObject(file)) continue;
+    let size = Number(file.size) || 0;
+    let mime = String(file.type || '');
+    const name = String(file.name || '');
+    try {
+      if (file.dataUrl) {
+        const decoded = decodeDataUrl(file.dataUrl);
+        size = decoded.buffer.length;
+        mime = mime || decoded.mime;
+      }
+      assertAllowedAttachment(field, { name, mime, size });
+    } catch (error) {
+      return error.message;
+    }
+  }
+  return '';
+}
+
+function assertAllowedAttachment(field, file) {
+  if (file.size > 10 * 1024 * 1024) throw new Error('Each file must be 10 MB or smaller');
+  if (field.type === 'signature' && !String(file.mime || '').startsWith('image/')) throw new Error('Signature uploads must be images');
+  const extension = path.extname(file.name || '').toLowerCase();
+  const mime = String(file.mime || '').toLowerCase();
+  const allowed = mime.startsWith('image/') || allowedFileMimes.has(mime) || allowedFileExtensions.has(extension);
+  if (!allowed) throw new Error('File type is not allowed');
+}
+
+function fieldFromRow(row) {
+  return {
+    id: row.id,
+    key: row.key,
+    label: row.label,
+    type: row.type,
+    required: Boolean(row.required),
+    description: row.description || '',
+    placeholder: row.placeholder || '',
+    defaultValue: row.default_value || '',
+    options: parseJson(row.options_json, []),
+    rows: parseJson(row.rows_json, []),
+    columns: parseJson(row.columns_json, []),
+    min: Number(row.min_value),
+    max: Number(row.max_value),
+    step: Number(row.step_value),
+    formula: row.formula || '',
+    price: Number(row.price) || 0,
+    currency: row.currency || '',
+    visibility: row.visibility_json ? parseJson(row.visibility_json, undefined) : undefined
+  };
+}
+
+function attachmentFromRow(row) {
+  return {
+    attachmentId: row.id,
+    name: row.name,
+    type: row.mime || '',
+    size: Number(row.size) || 0,
+    relativePath: row.relative_path,
+    createdAt: row.created_at
+  };
+}
+
+function mergeAttachmentMetadata(value, attachments) {
+  if (!attachments.length) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      if (!isObject(item)) return item;
+      const attachment = attachments.find((next) => next.attachmentId === item.attachmentId || next.name === item.name);
+      return attachment ? { ...item, ...attachment } : item;
+    });
+  }
+  if (isObject(value)) {
+    const attachment = attachments.find((next) => next.attachmentId === value.attachmentId || next.name === value.name);
+    return attachment ? { ...value, ...attachment } : value;
+  }
+  return value;
+}
+
+export function withAttachmentDownloadUrls(value) {
+  if (Array.isArray(value)) return value.map(withAttachmentDownloadUrls);
+  if (isObject(value) && value.attachmentId) {
+    return { ...value, downloadUrl: `/api/attachments/${encodeURIComponent(value.attachmentId)}` };
+  }
+  return value;
+}
+
+export function stripPrivateAttachmentData(value) {
+  if (Array.isArray(value)) return value.map(stripPrivateAttachmentData);
+  if (isObject(value)) {
+    const { attachmentId, relativePath, dataUrl, downloadUrl, ...rest } = value;
+    return rest;
+  }
+  return value;
+}
+
+function stripDownloadUrls(value) {
+  if (Array.isArray(value)) return value.map(stripDownloadUrls);
+  if (isObject(value)) {
+    const { downloadUrl, dataUrl, ...rest } = value;
+    return rest;
+  }
+  return value;
+}
+
+function attachmentsFromValue(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return values.filter((item) => isObject(item) && item.attachmentId && item.relativePath);
+}
+
+function decodeDataUrl(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:([^;,]+)?;base64,(.*)$/);
+  if (!match) throw new Error('Invalid file upload data');
+  return {
+    mime: match[1] || '',
+    buffer: Buffer.from(match[2], 'base64')
+  };
+}
+
+function sanitizeFileName(name) {
+  const cleaned = String(name || 'attachment')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return cleaned || 'attachment';
+}
+
+function mimeFromName(name) {
+  const ext = path.extname(name || '').toLowerCase();
+  if (['.jpg', '.jpeg'].includes(ext)) return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.csv') return 'text/csv';
+  if (ext === '.txt') return 'text/plain';
+  if (ext === '.zip') return 'application/zip';
+  return '';
+}
+
+function parseJson(value, fallback) {
+  try {
+    if (value === null || value === undefined || value === '') return fallback;
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function stringifyJson(value) {
+  return JSON.stringify(value ?? null);
+}
+
+function isObject(value) {
+  return typeof value === 'object' && value !== null;
+}
+
+function timestampForFile() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function now() {
+  return new Date().toISOString();
+}
+
+function id(prefix) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-5)}`;
+}

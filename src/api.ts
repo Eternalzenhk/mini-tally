@@ -1,4 +1,4 @@
-import type { AuthState, Form, FormResponse } from './types';
+import type { AuthState, Form, FormResponse, ResponsePage, WebhookEvent } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -62,5 +62,13 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   listResponses: (id: string) => request<FormResponse[]>(`/api/forms/${id}/responses`),
-  listPartials: (id: string) => request<FormResponse[]>(`/api/forms/${id}/partials`)
+  listPartials: (id: string) => request<FormResponse[]>(`/api/forms/${id}/partials`),
+  listResponsePage: (id: string, params: { status?: 'complete' | 'partial'; search?: string; from?: string; to?: string; page?: number; pageSize?: number }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== '') searchParams.set(key, String(value));
+    });
+    return request<ResponsePage>(`/api/forms/${id}/responses/page?${searchParams.toString()}`);
+  },
+  listWebhooks: (id: string) => request<WebhookEvent[]>(`/api/forms/${id}/webhooks`)
 };

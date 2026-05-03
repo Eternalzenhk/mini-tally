@@ -7,6 +7,10 @@ dist/
 # Local form data can contain submissions and uploaded file data.
 data/forms.json
 data/admin.json
+data/mini-tally.sqlite*
+data/uploads/
+data/*.bak
+data/*.migrated-*.bak
 
 .env
 .env.*
