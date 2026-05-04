@@ -1,4 +1,4 @@
-import type { AuditEvent, AuthState, EmailEvent, Form, FormResponse, FormVersion, MaintenanceEvent, ResponsePage, WebhookEvent } from './types';
+import type { AuditEvent, AuthState, EmailEvent, Form, FormResponse, FormVersion, MaintenanceEvent, ResponsePage, SmtpTestResult, WebhookEvent } from './types';
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -79,6 +79,7 @@ export const api = {
     });
     return request<ResponsePage>(`/api/forms/${id}/responses/page?${searchParams.toString()}`);
   },
+  getResponse: (id: string, responseId: string) => request<FormResponse>(`/api/forms/${id}/responses/${responseId}`),
   listWebhooks: (id: string) => request<WebhookEvent[]>(`/api/forms/${id}/webhooks`),
   retryWebhook: (id: string, eventId: string) =>
     request<WebhookEvent>(`/api/forms/${id}/webhooks/${eventId}/retry`, {
@@ -96,5 +97,14 @@ export const api = {
   runBackup: () =>
     request<MaintenanceEvent>('/api/maintenance/backups/run', {
       method: 'POST'
+    }),
+  restoreBackup: (backupId: string) =>
+    request<MaintenanceEvent>(`/api/maintenance/backups/${backupId}/restore`, {
+      method: 'POST'
+    }),
+  testSmtp: (to: string) =>
+    request<SmtpTestResult>('/api/maintenance/smtp/test', {
+      method: 'POST',
+      body: JSON.stringify({ to })
     })
 };

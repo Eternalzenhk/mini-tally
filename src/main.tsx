@@ -133,6 +133,9 @@ const text = {
     pageNext: 'Next',
     pagePrevious: 'Previous',
     downloadAttachment: 'Download',
+    viewResponse: 'View',
+    responseDetail: 'Response detail',
+    closeDetail: 'Close',
     webhookDeliveries: 'Webhook deliveries',
     noWebhooks: 'No webhook deliveries yet.',
     webhookStatus: 'Status',
@@ -144,6 +147,12 @@ const text = {
     backupCreated: 'Backup created',
     backupFailed: 'Backup failed',
     backupSize: 'Size',
+    restoreBackupAction: 'Restore',
+    backupRestored: 'Backup restored',
+    confirmRestoreBackup: 'Restore this backup? A safety backup will be created first.',
+    testSmtp: 'Test SMTP',
+    testEmailTo: 'Test email recipient',
+    smtpTestSent: 'SMTP test sent',
     settingsTitle: 'Settings',
     settingsText: 'Control access, submission limits, notifications, webhooks, and data retention.',
     customSlug: 'Custom slug',
@@ -280,6 +289,9 @@ const text = {
     pageNext: '下一頁',
     pagePrevious: '上一頁',
     downloadAttachment: '下載',
+    viewResponse: '查看',
+    responseDetail: '回覆詳情',
+    closeDetail: '關閉',
     webhookDeliveries: 'Webhook 傳送紀錄',
     noWebhooks: '還沒有 webhook 傳送紀錄。',
     webhookStatus: '狀態',
@@ -291,6 +303,12 @@ const text = {
     backupCreated: '已建立備份',
     backupFailed: '備份失敗',
     backupSize: '大小',
+    restoreBackupAction: '還原',
+    backupRestored: '已還原備份',
+    confirmRestoreBackup: '要還原這份備份嗎？系統會先建立安全備份。',
+    testSmtp: '測試 SMTP',
+    testEmailTo: '測試收件人',
+    smtpTestSent: 'SMTP 測試已送出',
     settingsTitle: '設定',
     settingsText: '控制存取、提交限制、通知、webhook 與資料保留。',
     customSlug: '自訂網址代稱',
@@ -1459,6 +1477,7 @@ function ResultsPanel({
   const [filters, setFilters] = useState({ search: '', from: '', to: '' });
   const [webhooks, setWebhooks] = useState<WebhookEvent[]>([]);
   const [emails, setEmails] = useState<EmailEvent[]>([]);
+  const [selectedResponse, setSelectedResponse] = useState<FormResponse | null>(null);
   const responseTotal = responsePage?.total ?? responses.length;
   const partialTotal = partialPage?.total ?? partials.length;
   const completionRate = responseTotal + partialTotal === 0 ? 0 : Math.round((responseTotal / (responseTotal + partialTotal)) * 100);
@@ -1490,6 +1509,11 @@ function ResultsPanel({
   async function applyFilters(event: React.FormEvent) {
     event.preventDefault();
     await Promise.all([loadPage('complete', 1), loadPage('partial', 1)]);
+  }
+
+  async function openResponse(responseId: string) {
+    const response = await api.getResponse(form.id, responseId);
+    setSelectedResponse(response);
   }
 
   return (
@@ -1540,8 +1564,9 @@ function ResultsPanel({
         </button>
       </form>
 
-      <ResponseTable title={t.responseTitle} form={form} responses={responses} page={responsePage} empty={t.noResponses} onPage={(page) => void loadPage('complete', page)} />
-      <ResponseTable title={t.partialTitle} form={form} responses={partials} page={partialPage} empty={t.noPartials} onPage={(page) => void loadPage('partial', page)} />
+      <ResponseTable title={t.responseTitle} form={form} responses={responses} page={responsePage} empty={t.noResponses} onPage={(page) => void loadPage('complete', page)} onOpen={openResponse} />
+      <ResponseTable title={t.partialTitle} form={form} responses={partials} page={partialPage} empty={t.noPartials} onPage={(page) => void loadPage('partial', page)} onOpen={openResponse} />
+      {selectedResponse && <ResponseDetail form={form} response={selectedResponse} close={() => setSelectedResponse(null)} />}
       <WebhookLog
         events={webhooks}
         retry={async (eventId) => {
@@ -1571,7 +1596,8 @@ function ResponseTable({
   responses,
   page,
   empty,
-  onPage
+  onPage,
+  onOpen
 }: {
   title: string;
   form: Form;
@@ -1579,8 +1605,20 @@ function ResponseTable({
   page: ResponsePage | null;
   empty: string;
   onPage: (page: number) => void;
+  onOpen: (responseId: string) => Promise<void>;
 }) {
   const { t } = useI18n();
+  const [opening, setOpening] = useState('');
+
+  async function open(responseId: string) {
+    setOpening(responseId);
+    try {
+      await onOpen(responseId);
+    } finally {
+      setOpening('');
+    }
+  }
+
   return (
     <div className="results-section">
       <div className="results-section-head">
@@ -1606,6 +1644,7 @@ function ResponseTable({
           <table className="response-table">
             <thead>
               <tr>
+                <th>{t.viewResponse}</th>
                 <th>{t.submitted}</th>
                 {form.fields.map((field) => (
                   <th key={field.id}>{field.label}</th>
@@ -1615,6 +1654,12 @@ function ResponseTable({
             <tbody>
               {responses.map((response) => (
                 <tr key={response.id}>
+                  <td>
+                    <button className="text-button compact-action" type="button" disabled={opening === response.id} onClick={() => void open(response.id)}>
+                      <Eye size={14} />
+                      {t.viewResponse}
+                    </button>
+                  </td>
                   <td>{formatDate(response.createdAt)}</td>
                   {form.fields.map((field) => (
                     <td key={field.id}>{renderAnswer(response.answers[field.id], t.downloadAttachment)}</td>
@@ -1626,6 +1671,45 @@ function ResponseTable({
         </div>
       )}
     </div>
+  );
+}
+
+function ResponseDetail({ form, response, close }: { form: Form; response: FormResponse; close: () => void }) {
+  const { t } = useI18n();
+  return (
+    <section className="results-section response-detail">
+      <div className="results-section-head">
+        <div>
+          <p className="eyebrow">{response.status}</p>
+          <h3>{t.responseDetail}</h3>
+        </div>
+        <button className="text-button compact-action" type="button" onClick={close}>
+          {t.closeDetail}
+        </button>
+      </div>
+      <div className="response-detail-meta">
+        <span>
+          <strong>{t.submitted}</strong>
+          {formatDate(response.createdAt)}
+        </span>
+        <span>
+          <strong>{t.webhookStatus}</strong>
+          {response.status}
+        </span>
+        <span>
+          <strong>Client</strong>
+          {response.clientId || '-'}
+        </span>
+      </div>
+      <div className="response-detail-list">
+        {form.fields.map((field) => (
+          <div className="response-detail-row" key={field.id}>
+            <strong>{field.label}</strong>
+            <div>{renderAnswer(response.answers[field.id], t.downloadAttachment)}</div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -1744,6 +1828,9 @@ function SettingsPanel({
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [backups, setBackups] = useState<MaintenanceEvent[]>([]);
   const [backupStatus, setBackupStatus] = useState('');
+  const [smtpTo, setSmtpTo] = useState(form.settings.emailNotifications);
+  const [smtpStatus, setSmtpStatus] = useState('');
+  const [smtpTesting, setSmtpTesting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1764,6 +1851,11 @@ function SettingsPanel({
       cancelled = true;
     };
   }, [form.id, form.updatedAt]);
+
+  useEffect(() => {
+    setSmtpTo(form.settings.emailNotifications);
+    setSmtpStatus('');
+  }, [form.id, form.settings.emailNotifications]);
 
   function updateSettings(patch: Partial<FormSettings>) {
     updateDraft((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
@@ -1786,6 +1878,28 @@ function SettingsPanel({
     } catch {
       setBackupStatus(t.backupFailed);
       setBackups(await api.listBackups().catch(() => backups));
+    }
+  }
+
+  async function restoreBackup(backupId: string) {
+    if (!window.confirm(t.confirmRestoreBackup)) return;
+    setBackupStatus('');
+    const event = await api.restoreBackup(backupId);
+    setBackups(await api.listBackups());
+    setBackupStatus(event.ok ? t.backupRestored : event.message || t.backupFailed);
+    if (event.ok) window.location.reload();
+  }
+
+  async function testSmtp() {
+    setSmtpTesting(true);
+    setSmtpStatus('');
+    try {
+      const result = await api.testSmtp(smtpTo);
+      setSmtpStatus(result.ok ? t.smtpTestSent : result.message);
+    } catch (error) {
+      setSmtpStatus(error && typeof error === 'object' && 'message' in error ? String(error.message) : t.saveFailed);
+    } finally {
+      setSmtpTesting(false);
     }
   }
 
@@ -1841,7 +1955,21 @@ function SettingsPanel({
         {t.redirectUrl}
         <input value={form.settings.redirectUrl} onChange={(event) => updateSettings({ redirectUrl: event.target.value })} onBlur={() => saveDraft()} />
       </label>
-      <BackupPanel backups={backups} status={backupStatus} runBackup={runBackup} />
+      <section className="ops-panel smtp-test-panel">
+        <div className="results-section-head">
+          <h3>{t.testSmtp}</h3>
+          <button className="text-button compact-action" type="button" disabled={smtpTesting} onClick={() => void testSmtp()}>
+            <Mail size={15} />
+            {t.testSmtp}
+          </button>
+        </div>
+        <label className="stack-label">
+          {t.testEmailTo}
+          <input value={smtpTo} onChange={(event) => setSmtpTo(event.target.value)} />
+        </label>
+        {smtpStatus && <div className="status-note">{smtpStatus}</div>}
+      </section>
+      <BackupPanel backups={backups} status={backupStatus} runBackup={runBackup} restoreBackup={restoreBackup} />
       <OperationalHistory versions={versions} auditEvents={auditEvents} restore={restoreVersion} />
     </section>
   );
@@ -1850,20 +1978,31 @@ function SettingsPanel({
 function BackupPanel({
   backups,
   status,
-  runBackup
+  runBackup,
+  restoreBackup
 }: {
   backups: MaintenanceEvent[];
   status: string;
   runBackup: () => Promise<void>;
+  restoreBackup: (backupId: string) => Promise<void>;
 }) {
   const { t } = useI18n();
   const [running, setRunning] = useState(false);
+  const [restoring, setRestoring] = useState('');
   async function run() {
     setRunning(true);
     try {
       await runBackup();
     } finally {
       setRunning(false);
+    }
+  }
+  async function restore(backupId: string) {
+    setRestoring(backupId);
+    try {
+      await restoreBackup(backupId);
+    } finally {
+      setRestoring('');
     }
   }
   return (
@@ -1888,6 +2027,11 @@ function BackupPanel({
               </span>
               <small>{formatBytes(backup.size)}</small>
               <time>{formatDate(backup.createdAt)}</time>
+              {backup.ok && (
+                <button className="text-button compact-action" type="button" disabled={restoring === backup.id} onClick={() => void restore(backup.id)}>
+                  {t.restoreBackupAction}
+                </button>
+              )}
             </div>
           ))}
         </div>

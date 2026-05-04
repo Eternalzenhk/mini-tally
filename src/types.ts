@@ -164,6 +164,12 @@ export type MaintenanceEvent = {
   createdAt: string;
 };
 
+export type SmtpTestResult = {
+  ok: boolean;
+  message: string;
+  to?: string[];
+};
+
 export type FormVersion = {
   id: string;
   formId: string;

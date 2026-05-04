@@ -488,6 +488,117 @@ export async function createBackup({ reason = 'manual', retain = 7 } = {}) {
   return event;
 }
 
+export async function restoreBackup(backupId) {
+  await ensureStore();
+  const source = database
+    .prepare('SELECT id, relative_path AS relativePath FROM maintenance_events WHERE id = ? AND kind = ? AND ok = 1')
+    .get(backupId, 'backup');
+  if (!source) {
+    const failed = {
+      id: id('mnt'),
+      kind: 'restore',
+      ok: false,
+      relativePath: '',
+      size: 0,
+      message: 'Backup not found',
+      createdAt: now()
+    };
+    await insertMaintenanceEvent(failed);
+    return failed;
+  }
+
+  const backupPath = backupAbsolutePath(source.relativePath);
+  if (!backupPath || !fsSync.existsSync(path.join(backupPath, 'mini-tally.sqlite'))) {
+    const failed = {
+      id: id('mnt'),
+      kind: 'restore',
+      ok: false,
+      relativePath: source.relativePath,
+      size: 0,
+      message: 'Backup files are missing',
+      createdAt: now()
+    };
+    await insertMaintenanceEvent(failed);
+    return failed;
+  }
+
+  const safetyBackup = await createBackup({ reason: 'pre-restore', retain: 14 });
+  if (!safetyBackup.ok) {
+    const failed = {
+      id: id('mnt'),
+      kind: 'restore',
+      ok: false,
+      relativePath: source.relativePath,
+      size: 0,
+      message: `Safety backup failed: ${safetyBackup.message || 'unknown error'}`,
+      createdAt: now()
+    };
+    await insertMaintenanceEvent(failed);
+    return failed;
+  }
+
+  const event = {
+    id: id('mnt'),
+    kind: 'restore',
+    ok: false,
+    relativePath: source.relativePath,
+    size: 0,
+    message: '',
+    createdAt: now()
+  };
+
+  try {
+    database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    database.close();
+    database = undefined;
+    initPromise = undefined;
+
+    await replaceFileFromBackup(backupPath, 'mini-tally.sqlite', sqlitePath, true);
+    await replaceFileFromBackup(backupPath, 'mini-tally.sqlite-wal', `${sqlitePath}-wal`, false);
+    await replaceFileFromBackup(backupPath, 'mini-tally.sqlite-shm', `${sqlitePath}-shm`, false);
+    await replaceFileFromBackup(backupPath, 'admin.json', legacyAdminPath, false);
+    await replaceFileFromBackup(backupPath, 'forms.json', legacyFormsPath, false);
+
+    await fs.rm(uploadsDir, { recursive: true, force: true });
+    if (fsSync.existsSync(path.join(backupPath, 'uploads'))) {
+      await fs.cp(path.join(backupPath, 'uploads'), uploadsDir, { recursive: true, force: true });
+    } else {
+      await fs.mkdir(uploadsDir, { recursive: true });
+    }
+
+    await ensureStore();
+    event.ok = true;
+    event.size = await directorySize(backupPath);
+    event.message = `Restored ${source.relativePath}; safety backup ${safetyBackup.relativePath}`;
+  } catch (error) {
+    initPromise = undefined;
+    await ensureStore();
+    event.message = error.message || 'Restore failed';
+  }
+
+  await insertMaintenanceEvent(event);
+  return event;
+}
+
+function backupAbsolutePath(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/');
+  if (!normalized.startsWith('backups/backup-')) return '';
+  const resolved = path.resolve(dataDir, normalized);
+  return resolved.startsWith(path.resolve(backupsDir)) ? resolved : '';
+}
+
+async function replaceFileFromBackup(backupPath, backupName, destination, required) {
+  const source = path.join(backupPath, backupName);
+  if (!fsSync.existsSync(source)) {
+    await fs.rm(destination, { force: true });
+    if (required) throw new Error(`${backupName} is missing`);
+    return;
+  }
+  const tempPath = `${destination}.restore-${Date.now()}.tmp`;
+  await fs.copyFile(source, tempPath);
+  await fs.rename(tempPath, destination);
+}
+
 async function pruneBackups(retain) {
   const keep = Math.max(1, Math.min(30, Number(retain) || 7));
   const entries = await fs.readdir(backupsDir, { withFileTypes: true }).catch(() => []);

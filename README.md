@@ -47,6 +47,8 @@ SMTP_FROM="Mini Tally <user@example.com>"
 
 If SMTP is not configured, submissions still succeed and the email delivery log records `SMTP is not configured`.
 
+Use the Settings tab SMTP test panel to send a one-off test email after adding SMTP variables. The test endpoint requires admin login and returns a clear error if SMTP is not configured, so it is safe to run before turning on real notifications.
+
 Webhook failures are retried automatically in the background. Useful tuning variables:
 
 ```bash
@@ -63,6 +65,8 @@ ENABLE_SCHEDULED_BACKUPS="true"
 BACKUP_INTERVAL_HOURS="24"
 BACKUP_RETAIN="7"
 ```
+
+The backup panel also includes a restore action for successful in-app backups. Restore creates a fresh pre-restore safety backup first; if that safety backup fails, the restore is cancelled.
 
 ## Hostinger Deployment
 
@@ -135,6 +139,7 @@ Before deploying the protected workspace to Hostinger, make sure the Hostinger N
 - Webhook posting with optional HMAC signature
 - Webhook delivery log, manual retry, and automatic failed-delivery retry
 - Email notification delivery log with optional SMTP sending
+- Admin SMTP test action
 - Local data retention cleanup
 - SQLite storage with automatic legacy `forms.json` migration
 - File uploads stored under `data/uploads` with protected admin downloads
@@ -143,7 +148,7 @@ Before deploying the protected workspace to Hostinger, make sure the Hostinger N
 - Form duplication
 - Form version history with restore
 - Admin activity log for form and response operations
-- Manual in-app backups with optional scheduled backups
+- Manual in-app backups, one-click restore, and optional scheduled backups
 
 ## Local Limitations
 
@@ -169,7 +174,9 @@ Do not commit `data/mini-tally.sqlite*`, `data/uploads`, `data/backups`, `data/a
 
 The SSH deploy script creates timestamped backups in `.deploy-backup-*` inside the Hostinger app folder before every release. Each backup contains the previous `data` folder, including `mini-tally.sqlite`, SQLite WAL/SHM sidecar files, uploads, and legacy admin/form JSON files.
 
-The app also creates manual or scheduled backups under `data/backups`. To restore an in-app backup from SSH:
+The app also creates manual or scheduled backups under `data/backups`. The normal restore path is the Settings tab backup panel, which creates a pre-restore safety backup and reloads the admin workspace after success.
+
+To restore an in-app backup manually from SSH:
 
 ```bash
 cd /home/your-user/apps/mini-tally

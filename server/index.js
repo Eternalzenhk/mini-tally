@@ -21,6 +21,7 @@ import {
   materializeAnswers,
   readAdminConfig,
   readDb,
+  restoreBackup,
   stripPrivateAttachmentData,
   updateDb,
   validateAttachmentValue,
@@ -1323,6 +1324,15 @@ app.get('/api/forms/:id/responses/page', requireAdmin, async (req, res) => {
   res.json({ ...result, items: result.items.map(adminResponse) });
 });
 
+app.get('/api/forms/:id/responses/:responseId', requireAdmin, async (req, res) => {
+  const db = await readDb();
+  const form = findForm(db, req.params.id);
+  if (!form) return res.status(404).json({ message: 'Form not found' });
+  const response = db.responses.find((item) => item.id === req.params.responseId && item.formId === form.id);
+  if (!response) return res.status(404).json({ message: 'Response not found' });
+  res.json(adminResponse(response));
+});
+
 app.get('/api/forms/:id/webhooks', requireAdmin, async (req, res) => {
   const db = await readDb();
   const form = findForm(db, req.params.id);
@@ -1371,6 +1381,37 @@ app.post('/api/maintenance/backups/run', requireAdmin, async (_req, res) => {
     metadata: { ok: event.ok, path: event.relativePath, size: event.size }
   });
   res.status(event.ok ? 201 : 500).json(event);
+});
+
+app.post('/api/maintenance/backups/:backupId/restore', requireAdmin, async (req, res) => {
+  const event = await restoreBackup(req.params.backupId);
+  await audit('backup.restored', {
+    targetId: req.params.backupId,
+    message: event.message,
+    metadata: { ok: event.ok, path: event.relativePath, size: event.size }
+  });
+  res.status(event.ok ? 200 : 400).json(event);
+});
+
+app.post('/api/maintenance/smtp/test', requireAdmin, async (req, res) => {
+  const rawTo = Object.hasOwn(req.body || {}, 'to') ? req.body.to : process.env.SMTP_TEST_TO || process.env.SMTP_FROM || process.env.SMTP_USER || '';
+  const to = notificationRecipients(rawTo);
+  const config = configuredSmtp();
+  if (!to.length) return res.status(400).json({ ok: false, message: 'Enter a test recipient email address' });
+  if (!config) return res.status(400).json({ ok: false, message: 'SMTP is not configured' });
+
+  try {
+    await smtpSendMail(config, {
+      to,
+      subject: 'Mini Tally SMTP test',
+      text: `Mini Tally SMTP test sent at ${now()}`
+    });
+    await audit('smtp.tested', { message: `SMTP test sent to ${to.join(', ')}`, metadata: { to } });
+    res.json({ ok: true, message: 'Test email sent', to });
+  } catch (error) {
+    await audit('smtp.test_failed', { message: error.message || 'SMTP test failed', metadata: { to } });
+    res.status(500).json({ ok: false, message: error.message || 'SMTP test failed', to });
+  }
 });
 
 app.get('/api/forms/:id/responses.csv', requireAdmin, async (req, res) => {

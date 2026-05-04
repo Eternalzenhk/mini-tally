@@ -1141,8 +1141,60 @@ a {
   background: #fbfcfa;
 }
 
+.response-table th:first-child,
+.response-table td:first-child {
+  width: 92px;
+  white-space: nowrap;
+}
+
 .response-table tr:last-child td {
   border-bottom: 0;
+}
+
+.response-detail {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--surface);
+}
+
+.response-detail-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.response-detail-meta span,
+.response-detail-row {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 11px 12px;
+  background: #fbfcfa;
+}
+
+.response-detail-meta span,
+.response-detail-row {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.response-detail-meta strong,
+.response-detail-row strong {
+  color: var(--ink);
+  font-size: 0.82rem;
+}
+
+.response-detail-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.response-detail-row > div {
+  min-width: 0;
 }
 
 .webhook-log-list {
@@ -1226,7 +1278,7 @@ a {
 }
 
 .ops-row.backup {
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
 }
 
 .ops-row:last-child {
@@ -1258,6 +1310,11 @@ a {
 
 .backup-panel {
   margin-top: 22px;
+}
+
+.smtp-test-panel {
+  margin-top: 22px;
+  max-width: 720px;
 }
 
 .status-note {
@@ -1580,7 +1637,9 @@ a {
   .webhook-log-row,
   .webhook-log-row.compact,
   .ops-row,
-  .ops-row.backup {
+  .ops-row.backup,
+  .response-detail-meta,
+  .response-detail-list {
     grid-template-columns: 1fr;
     align-items: start;
   }
